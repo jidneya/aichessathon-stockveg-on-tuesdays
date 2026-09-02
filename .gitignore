@@ -5,3 +5,4 @@ __pycache__/
 submission.zip
 *.pgn
 .vscode/
+.DS_Store
