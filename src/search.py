@@ -12,7 +12,7 @@ def generate_legal_moves(board):
     return np.empty(0, dtype=np.uint16) 
 
 @njit(cache=True)
-def make_move(board, move):§
+def make_move(board, move):
     pass
 
 @njit(cache=True)
@@ -90,46 +90,59 @@ def tt_probe(h: np.uint64, depth: int, alpha: int, beta: int):
 # NEGAMAX + ALPHA-BETA PRUNING
 # =============================================================================
 @njit(cache=True)
-def negamax(board, depth, alpha, beta, color):
-    h = compute_hash(board)
-    
-    hit, tt_score, tt_move = tt_probe(h, depth, alpha, beta)
-    if hit:
-        return tt_score
+def make_null_move(board):
+    # Member 3 will implement: flips the side to move and clears en passant
+    pass
 
-    if depth == 0:
-        return evaluate(board) * color
+@njit(cache=True)
+def negamax(board, depth, alpha, beta, color, allow_null=True):
+    h = compute_hash(board)
+    hit, tt_score, tt_move = tt_probe(h, depth, alpha, beta)
+    if hit: return tt_score
+
+    if depth <= 0: return evaluate(board) * color
+
+    # Null-Move Pruning (R=2 depth reduction)
+    if allow_null and depth >= 3:
+        null_board = copy_board(board)
+        make_null_move(null_board)
+        null_score = -negamax(null_board, depth - 3, -beta, -beta + 1, -color, False)
+        if null_score >= beta:
+            return beta
 
     moves = generate_legal_moves(board)
-    if len(moves) == 0:
-        return -INFINITY + 1 
+    if len(moves) == 0: return -INFINITY + 1 
 
     best_score = -INFINITY
     best_move = np.uint16(0)
     original_alpha = alpha
 
-    for move in moves:
+    for i, move in enumerate(moves):
         new_board = copy_board(board)
         make_move(new_board, move)
         
-        score = -negamax(new_board, depth - 1, -beta, -alpha, -color)
+        # Principal Variation Search (PVS)
+        if i == 0:
+            score = -negamax(new_board, depth - 1, -beta, -alpha, -color, True)
+        else:
+            # Zero-window search
+            score = -negamax(new_board, depth - 1, -alpha - 1, -alpha, -color, True)
+            if alpha < score < beta:
+                # Re-search with full window if it fails high
+                score = -negamax(new_board, depth - 1, -beta, -score, -color, True)
 
         if score > best_score:
             best_score = score
             best_move = move
 
         alpha = max(alpha, score)
-        if alpha >= beta:
-            break 
+        if alpha >= beta: break 
 
     flag = FLAG_EXACT
-    if best_score <= original_alpha:
-        flag = FLAG_UPPERBOUND
-    elif best_score >= beta:
-        flag = FLAG_LOWERBOUND
+    if best_score <= original_alpha: flag = FLAG_UPPERBOUND
+    elif best_score >= beta: flag = FLAG_LOWERBOUND
         
     tt_store(h, depth, best_score, flag, best_move)
-
     return best_score
 
 # =============================================================================
