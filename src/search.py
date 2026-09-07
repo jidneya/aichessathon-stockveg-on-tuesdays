@@ -150,24 +150,29 @@ def negamax(board, depth, alpha, beta, color, allow_null=True):
 # =============================================================================
 def get_best_move(board_array, time_left_ms):
     start_time = time.time()
-    time_limit = (time_left_ms * 0.03) / 1000.0 
+    base_time_limit = (time_left_ms * 0.03) / 1000.0 
     color = 1 if get_side(board_array) == 0 else -1
     
     last_completed_move = 0
+    last_eval = 0
     
-    for depth in range(1, 10): 
-        score = negamax(board_array, depth, -INFINITY, INFINITY, color)
+    for depth in range(1, 15): 
+        # Pass True for allow_null on the initial call
+        score = negamax(board_array, depth, -INFINITY, INFINITY, color, True)
         
         h = compute_hash(board_array)
         index = int(h & TT_MASK)
         current_best = TT_MOVE[index]
         
-        # Abort if time exceeded, discard current depth results
+        # Extend time if the score swings dramatically (instability)
+        time_limit = base_time_limit * 2.0 if abs(score - last_eval) > 150 else base_time_limit
+        
         if time.time() - start_time > time_limit:
-            if last_completed_move == 0:
-                last_completed_move = current_best
+            if last_completed_move == 0: last_completed_move = current_best
             break 
             
         last_completed_move = current_best
+        last_eval = score
             
     return last_completed_move
+
