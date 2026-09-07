@@ -1,10 +1,12 @@
 import time
 import numpy as np
 from numba import njit, uint64, int32, int8, uint8, uint16
+from numba.typed import Dict
+from numba.core import types
 
-from board import copy_board, get_side, piece_on
+from src.board import copy_board, get_side, piece_on
 # Import NNUE evaluation
-from evaluate import evaluate
+from src.evaluate import evaluate
 
 # =============================================================================
 # STUBS FOR MEMBER 2 & 3
@@ -15,6 +17,11 @@ def generate_legal_moves(board):
 
 @njit(cache=True)
 def make_move(board, move):
+    pass
+
+@njit(cache=True)
+def make_null_move(board):
+    # Member 3 will implement: flips the side to move and clears en passant
     pass
 
 # =============================================================================
@@ -36,67 +43,67 @@ def compute_hash(board: np.ndarray) -> np.uint64:
     return h
 
 # =============================================================================
-# TRANSPOSITION TABLE
+# TRANSPOSITION TABLE (Using Numba Typed Dict)
 # =============================================================================
-TT_SIZE = 1048576 
-TT_MASK = TT_SIZE - 1
-
-TT_HASH = np.zeros(TT_SIZE, dtype=np.uint64)
-TT_SCORE = np.zeros(TT_SIZE, dtype=np.int32)
-TT_DEPTH = np.zeros(TT_SIZE, dtype=np.int8)
-TT_FLAG = np.zeros(TT_SIZE, dtype=np.uint8)
-TT_MOVE = np.zeros(TT_SIZE, dtype=np.uint16)
+INFINITY = 999999
 
 FLAG_NONE = 0
 FLAG_EXACT = 1
 FLAG_LOWERBOUND = 2
 FLAG_UPPERBOUND = 3
-INFINITY = 999999
+
+# TT Entry: (depth, score, flag, best_move)
+# We'll use a typed dict instead of parallel arrays to avoid readonly issues
+def create_tt():
+    """Create a new transposition table (called once at startup)"""
+    tt = Dict.empty(
+        key_type=types.uint64,
+        value_type=types.UniTuple(types.int32, 4),  # (depth, score, flag, best_move)
+    )
+    return tt
+
+# Global TT instance (created at module load)
+TT = create_tt()
 
 @njit(cache=True)
-def tt_store(h: np.uint64, depth: int, score: int, flag: int, best_move: int):
-    index = int(h & TT_MASK)
-    TT_HASH[index] = h
-    TT_DEPTH[index] = depth
-    TT_SCORE[index] = score
-    TT_FLAG[index] = flag
-    TT_MOVE[index] = best_move
+def tt_store(tt, h: np.uint64, depth: int, score: int, flag: int, best_move: int):
+    """Store position in transposition table"""
+    tt[h] = (int32(depth), int32(score), int32(flag), int32(best_move))
 
 @njit(cache=True)
-def tt_probe(h: np.uint64, depth: int, alpha: int, beta: int):
-    index = int(h & TT_MASK)
-    hit = False
-    score = int32(0)
-    move = np.uint16(0)
+def tt_probe(tt, h: np.uint64, depth: int, alpha: int, beta: int):
+    """
+    Probe transposition table.
+    Returns: (hit: bool, score: int32, move: int32)
+    """
+    if h not in tt:
+        return False, int32(0), int32(0)
     
-    if TT_HASH[index] == h:
-        move = TT_MOVE[index]
-        if TT_DEPTH[index] >= depth:
-            flag = TT_FLAG[index]
-            s = TT_SCORE[index]
-            if flag == FLAG_EXACT:
-                hit = True; score = s
-            elif flag == FLAG_LOWERBOUND and s >= beta:
-                hit = True; score = s
-            elif flag == FLAG_UPPERBOUND and s <= alpha:
-                hit = True; score = s
-                
-    # Numba demands uniform return types: (boolean, int32, uint16)
-    return hit, score, move
+    stored_depth, stored_score, stored_flag, stored_move = tt[h]
+    
+    # Return move even if depth is insufficient
+    if stored_depth < depth:
+        return False, int32(0), int32(stored_move)
+    
+    # Check if we can use the stored score
+    if stored_flag == FLAG_EXACT:
+        return True, int32(stored_score), int32(stored_move)
+    elif stored_flag == FLAG_LOWERBOUND and stored_score >= beta:
+        return True, int32(stored_score), int32(stored_move)
+    elif stored_flag == FLAG_UPPERBOUND and stored_score <= alpha:
+        return True, int32(stored_score), int32(stored_move)
+    
+    return False, int32(0), int32(stored_move)
 
 # =============================================================================
 # NEGAMAX + ALPHA-BETA PRUNING
 # =============================================================================
 @njit(cache=True)
-def make_null_move(board):
-    # Member 3 will implement: flips the side to move and clears en passant
-    pass
-
-@njit(cache=True)
-def negamax(board, depth, alpha, beta, color, allow_null=True):
+def negamax(board, depth, alpha, beta, color, tt, allow_null=True):
     h = compute_hash(board)
-    hit, tt_score, tt_move = tt_probe(h, depth, alpha, beta)
-    if hit: return tt_score
+    hit, tt_score, tt_move = tt_probe(tt, h, depth, alpha, beta)
+    if hit: 
+        return tt_score
 
     if depth <= 0: 
         # NNUE evaluation returns score from side-to-move perspective
@@ -107,15 +114,16 @@ def negamax(board, depth, alpha, beta, color, allow_null=True):
     if allow_null and depth >= 3:
         null_board = copy_board(board)
         make_null_move(null_board)
-        null_score = -negamax(null_board, depth - 3, -beta, -beta + 1, -color, False)
+        null_score = -negamax(null_board, depth - 3, -beta, -beta + 1, -color, tt, False)
         if null_score >= beta:
             return beta
 
     moves = generate_legal_moves(board)
-    if len(moves) == 0: return -INFINITY + 1 
+    if len(moves) == 0: 
+        return -INFINITY + 1 
 
     best_score = -INFINITY
-    best_move = np.uint16(0)
+    best_move = int32(0)
     original_alpha = alpha
 
     for i, move in enumerate(moves):
@@ -124,32 +132,45 @@ def negamax(board, depth, alpha, beta, color, allow_null=True):
         
         # Principal Variation Search (PVS)
         if i == 0:
-            score = -negamax(new_board, depth - 1, -beta, -alpha, -color, True)
+            score = -negamax(new_board, depth - 1, -beta, -alpha, -color, tt, True)
         else:
             # Zero-window search
-            score = -negamax(new_board, depth - 1, -alpha - 1, -alpha, -color, True)
+            score = -negamax(new_board, depth - 1, -alpha - 1, -alpha, -color, tt, True)
             if alpha < score < beta:
                 # Re-search with full window if it fails high
-                score = -negamax(new_board, depth - 1, -beta, -score, -color, True)
+                score = -negamax(new_board, depth - 1, -beta, -score, -color, tt, True)
 
         if score > best_score:
             best_score = score
-            best_move = move
+            best_move = int32(move)
 
         alpha = max(alpha, score)
-        if alpha >= beta: break 
+        if alpha >= beta: 
+            break 
 
     flag = FLAG_EXACT
-    if best_score <= original_alpha: flag = FLAG_UPPERBOUND
-    elif best_score >= beta: flag = FLAG_LOWERBOUND
+    if best_score <= original_alpha: 
+        flag = FLAG_UPPERBOUND
+    elif best_score >= beta: 
+        flag = FLAG_LOWERBOUND
         
-    tt_store(h, depth, best_score, flag, best_move)
+    tt_store(tt, h, depth, best_score, flag, best_move)
     return best_score
 
 # =============================================================================
 # ITERATIVE DEEPENING & TIME MANAGEMENT
 # =============================================================================
 def get_best_move(board_array, time_left_ms):
+    """
+    Find the best move using iterative deepening.
+    
+    Args:
+        board_array: Current board position
+        time_left_ms: Remaining time in milliseconds
+    
+    Returns:
+        Best move (encoded as uint16)
+    """
     start_time = time.time()
     base_time_limit = (time_left_ms * 0.03) / 1000.0 
     color = 1 if get_side(board_array) == 0 else -1
@@ -157,19 +178,26 @@ def get_best_move(board_array, time_left_ms):
     last_completed_move = 0
     last_eval = 0
     
+    # Use the global TT
+    global TT
+    
     for depth in range(1, 15): 
-        # Pass True for allow_null on the initial call
-        score = negamax(board_array, depth, -INFINITY, INFINITY, color, True)
+        # Pass TT to negamax
+        score = negamax(board_array, depth, -INFINITY, INFINITY, color, TT, True)
         
+        # Get best move from TT
         h = compute_hash(board_array)
-        index = int(h & TT_MASK)
-        current_best = TT_MOVE[index]
+        if h in TT:
+            _, _, _, current_best = TT[h]
+        else:
+            current_best = last_completed_move
         
         # Extend time if the score swings dramatically (instability)
         time_limit = base_time_limit * 2.0 if abs(score - last_eval) > 150 else base_time_limit
         
         if time.time() - start_time > time_limit:
-            if last_completed_move == 0: last_completed_move = current_best
+            if last_completed_move == 0: 
+                last_completed_move = current_best
             break 
             
         last_completed_move = current_best

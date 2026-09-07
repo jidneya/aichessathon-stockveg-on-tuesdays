@@ -1,12 +1,12 @@
 import threading
-from board import (
+from src.board import (
     board_from_fen,
     move_to_uci,
     copy_board,
     # generate_legal_moves,  <-- Import your move generator function when built
 )
-from search import get_best_move, negamax
-from evaluate import initialize_nnue
+from src.search import get_best_move, negamax
+from src.evaluate import initialize_nnue
 
 # =============================================================================
 # NNUE INITIALIZATION (CALLED ONCE AT MODULE LOAD)

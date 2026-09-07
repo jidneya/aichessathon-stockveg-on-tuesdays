@@ -1,7 +1,7 @@
 import numpy as np
 from numba import njit, int16, int32
 
-from board import piece_on, get_side
+from src.board import piece_on, get_side
 
 # =============================================================================
 # NNUE ARCHITECTURE CONSTANTS
