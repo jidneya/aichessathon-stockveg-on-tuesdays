@@ -1,58 +1,38 @@
+import threading
 from board import(
     board_from_fen,
     move_to_uci,
-    # generate_legal_moves,  <-- Import your move generator function when built
+    copy_board,
+    #generate_legal_moves,  <-- Import your move generator function when built
 )
-from search import get_best_move
+from search import get_best_move, negamax
 
-# =============================================================================
-# WARMUP / PRE-COMPUTATION (Runs once on import within the 60s setup budget)
-# =============================================================================
-# Trigger Numba's JIT compilation here so your bot doesn't lose time 
-# compiling functions during the first move's clock.
-# _dummy_board = board_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-# Call your JIT search / movegen once to force compilation ahead of time
-# _ = generate_legal_moves(_dummy_board)
+ponder_thread = None
+stop_event = threading.Event()
 
-# Import time runs once per game, inside a 60 second budget, before your clock starts.
-# Load weights and build tables out here, not inside get_move.
+def ponder_worker(fen):
+    board_array = board_from_fen(fen)
+    # Simple background search to populate TT while waiting
+    depth = 1
+    while not stop_event.is_set() and depth < 10:
+        negamax(board_array, depth, -999999, 999999, 1, True)
+        depth += 1
 
-
-# def get_move(fen: str, time_left_ms: int) -> str:
-#     """Return a legal move in UCI notation.
-#     fen           the position to move in; your colour is the side to move
-#     time_left_ms  your clock before this move, in milliseconds
-#     returns       "e2e4", or "e7e8q" for a promotion
-#     The process stays alive between your moves, so state you keep on a module or in a
-#     closure survives to the next call. It does not survive to the next game.
-#     print() is safe. Your stdout is redirected away from the protocol stream, discarded
-#     during rated games and shown back to you in the validation log.
-    
-#     fen: the current position
-#     time_left_ms: remaining clock time in milliseconds
-#     returns: "e2e4", "g1f3", "e7e8q", etc.
-#     """
-#     board = chess.Board(fen)
-#     # Everything from here down is yours to replace. baselines/greedy searches one ply,
-#     # baselines/minimax searches two. Neither is strong. Reading them is the fastest way
-#     # to see the shape of a search, and beating them is the first real milestone.
-#     return random.choice(list(board.legal_moves)).uci()
-#     # 1. Parse the incoming FEN string into your Numba board array
-#     board = board_from_fen(fen)
-#     # 2. Generate legal moves for the current position
-#     # legal_moves = generate_legal_moves(board)
-#     # -------------------------------------------------------------------------
-#     # 3. Search / Decision Logic (Placeholder)
-#     # Pass 'board' and 'time_left_ms' into your minimax/alphabeta or NN evaluation.
-#     # chosen_move = search(board, legal_moves, time_left_ms)
-#     # -------------------------------------------------------------------------
-    
-#     # Example placeholder return until movegen is plugged in:
-#     # return move_to_uci(chosen_move)
-#     pass
 def get_move(fen: str, time_left_ms: int) -> str:
-    """Entry point for the tournament harness."""
+    global ponder_thread
+    
+    # 1. Stop any active pondering from the opponent's turn
+    if ponder_thread and ponder_thread.is_alive():
+        stop_event.set()
+        ponder_thread.join()
+        
+    # 2. Calculate our best move
     board_array = board_from_fen(fen)
     best_encoded_move = get_best_move(board_array, time_left_ms)
+    
+    # 3. Start a new ponder thread for the predicted future state
+    stop_event.clear()
+    ponder_thread = threading.Thread(target=ponder_worker, args=(fen,), daemon=True)
+    ponder_thread.start()
 
     return move_to_uci(best_encoded_move)
