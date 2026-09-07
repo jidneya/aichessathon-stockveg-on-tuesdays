@@ -3,6 +3,8 @@ import numpy as np
 from numba import njit, uint64, int32, int8, uint8, uint16
 
 from board import copy_board, get_side, piece_on
+# Import NNUE evaluation
+from evaluate import evaluate
 
 # =============================================================================
 # STUBS FOR MEMBER 2 & 3
@@ -14,10 +16,6 @@ def generate_legal_moves(board):
 @njit(cache=True)
 def make_move(board, move):
     pass
-
-@njit(cache=True)
-def evaluate(board):
-    return 0 
 
 # =============================================================================
 # ZOBRIST HASHING
@@ -100,7 +98,10 @@ def negamax(board, depth, alpha, beta, color, allow_null=True):
     hit, tt_score, tt_move = tt_probe(h, depth, alpha, beta)
     if hit: return tt_score
 
-    if depth <= 0: return evaluate(board) * color
+    if depth <= 0: 
+        # NNUE evaluation returns score from side-to-move perspective
+        # Multiply by color to convert to current search perspective
+        return evaluate(board) * color
 
     # Null-Move Pruning (R=2 depth reduction)
     if allow_null and depth >= 3:
@@ -175,4 +176,3 @@ def get_best_move(board_array, time_left_ms):
         last_eval = score
             
     return last_completed_move
-
