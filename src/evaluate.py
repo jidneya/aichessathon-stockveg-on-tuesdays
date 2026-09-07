@@ -56,7 +56,7 @@ def initialize_nnue(checkpoint_path="checkpoints/1_simple/quantised.bin"):
         # Read L1 bias: 1 value
         L1_BIASES = np.fromfile(f, dtype=np.int16, count=1)[0]
     
-    print(f"✓ Loaded NNUE checkpoint from {checkpoint_path}")
+    print(f" Loaded NNUE checkpoint from {checkpoint_path}")
     print(f"  L0 weights: {L0_WEIGHTS.shape}, L0 biases: {L0_BIASES.shape}")
     print(f"  L1 weights: {L1_WEIGHTS.shape}, L1 bias: scalar")
 

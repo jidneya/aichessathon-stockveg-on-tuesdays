@@ -4,25 +4,125 @@ from numba import njit, uint64, int32, int8, uint8, uint16
 from numba.typed import Dict
 from numba.core import types
 
-from src.board import copy_board, get_side, piece_on
+from src.board import copy_board, get_side, piece_on, encode_move
 # Import NNUE evaluation
 from src.evaluate import evaluate
 
 # =============================================================================
-# STUBS FOR MEMBER 2 & 3
+# TEMPORARY STUBS FOR MEMBER 2 & 3
 # =============================================================================
 @njit(cache=True)
 def generate_legal_moves(board):
-    return np.empty(0, dtype=np.uint16) 
+    """
+    TEMPORARY STUB: Returns a few basic pawn moves to prevent crashes.
+    Replace this with full legal move generation!
+    """
+    moves = []
+    side = get_side(board)
+    
+    # Generate some basic pawn moves to make the engine playable
+    if side == 0:  # White to move
+        # Try moving pawns from rank 2 to rank 3 or rank 4
+        for file in range(8):
+            sq = 8 + file  # Rank 2
+            piece = piece_on(board, sq)
+            if piece == 0:  # White pawn
+                # One square forward
+                target = sq + 8
+                if piece_on(board, target) == -1:
+                    moves.append(encode_move(sq, target))
+                    # Two squares forward from starting position
+                    target2 = sq + 16
+                    if piece_on(board, target2) == -1:
+                        moves.append(encode_move(sq, target2))
+        
+        # Try moving pawns from rank 3-6 forward
+        for rank in range(2, 6):
+            for file in range(8):
+                sq = rank * 8 + file
+                piece = piece_on(board, sq)
+                if piece == 0:  # White pawn
+                    target = sq + 8
+                    if target < 64 and piece_on(board, target) == -1:
+                        moves.append(encode_move(sq, target))
+    else:  # Black to move
+        # Try moving pawns from rank 7 to rank 6 or rank 5
+        for file in range(8):
+            sq = 48 + file  # Rank 7
+            piece = piece_on(board, sq)
+            if piece == 6:  # Black pawn
+                # One square forward
+                target = sq - 8
+                if piece_on(board, target) == -1:
+                    moves.append(encode_move(sq, target))
+                    # Two squares forward from starting position
+                    target2 = sq - 16
+                    if piece_on(board, target2) == -1:
+                        moves.append(encode_move(sq, target2))
+        
+        # Try moving pawns from rank 6-3 forward
+        for rank in range(5, 1, -1):
+            for file in range(8):
+                sq = rank * 8 + file
+                piece = piece_on(board, sq)
+                if piece == 6:  # Black pawn
+                    target = sq - 8
+                    if target >= 0 and piece_on(board, target) == -1:
+                        moves.append(encode_move(sq, target))
+    
+    # Return at least one move if we found any
+    if len(moves) > 0:
+        return np.array(moves, dtype=np.uint16)
+    else:
+        # Last resort: return a null move to prevent crash
+        return np.array([0], dtype=np.uint16)
 
 @njit(cache=True)
 def make_move(board, move):
-    pass
+    """
+    TEMPORARY STUB: Makes a basic move (piece relocation only).
+    Replace this with full move making including captures, castling, etc.!
+    """
+    from_sq = move & 63
+    to_sq = (move >> 6) & 63
+    
+    # Get the piece being moved
+    piece = piece_on(board, from_sq)
+    if piece == -1:
+        return  # Invalid move
+    
+    # Remove piece from source square
+    board[piece] = board[piece] & ~(uint64(1) << uint64(from_sq))
+    
+    # Place piece on destination square (remove any captured piece first)
+    captured = piece_on(board, to_sq)
+    if captured != -1:
+        board[captured] = board[captured] & ~(uint64(1) << uint64(to_sq))
+    
+    board[piece] = board[piece] | (uint64(1) << uint64(to_sq))
+    
+    # Update occupancy bitboards
+    if piece < 6:  # White piece
+        board[12] = board[12] & ~(uint64(1) << uint64(from_sq))
+        board[12] = board[12] | (uint64(1) << uint64(to_sq))
+    else:  # Black piece
+        board[13] = board[13] & ~(uint64(1) << uint64(from_sq))
+        board[13] = board[13] | (uint64(1) << uint64(to_sq))
+    
+    # Update all occupancy
+    board[14] = board[12] | board[13]
+    
+    # Flip side to move
+    board[17] = 1 - board[17]
+    
+    # Clear en passant square (simplified)
+    board[15] = 64
 
 @njit(cache=True)
 def make_null_move(board):
-    # Member 3 will implement: flips the side to move and clears en passant
-    pass
+    """Flip the side to move and clear en passant."""
+    board[17] = 1 - board[17]  # Flip side
+    board[15] = 64  # Clear en passant
 
 # =============================================================================
 # ZOBRIST HASHING
@@ -162,7 +262,7 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null=True):
 # =============================================================================
 def get_best_move(board_array, time_left_ms):
     """
-    Find the best move using iterative deepening.
+    Main search function with iterative deepening.
     
     Args:
         board_array: Current board position
@@ -182,7 +282,7 @@ def get_best_move(board_array, time_left_ms):
     global TT
     
     for depth in range(1, 15): 
-        # Pass TT to negamax
+        # Run search at current depth
         score = negamax(board_array, depth, -INFINITY, INFINITY, color, TT, True)
         
         # Get best move from TT
@@ -190,7 +290,7 @@ def get_best_move(board_array, time_left_ms):
         if h in TT:
             _, _, _, current_best = TT[h]
         else:
-            current_best = last_completed_move
+            current_best = 0
         
         # Extend time if the score swings dramatically (instability)
         time_limit = base_time_limit * 2.0 if abs(score - last_eval) > 150 else base_time_limit
@@ -202,5 +302,5 @@ def get_best_move(board_array, time_left_ms):
             
         last_completed_move = current_best
         last_eval = score
-            
-    return last_completed_move
+    
+    return int(last_completed_move)
