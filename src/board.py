@@ -17,8 +17,8 @@ CASTLE_BK = np.uint8(4)   # Black kingside
 CASTLE_BQ = np.uint8(8)   # Black queenside
 
 # File/Rank masks (precomputed)
-FILE_A = np.uint64(0x0101010101010101)
-FILE_H = np.uint64(0x8080808080808080)
+FILE_A  = np.uint64(0x0101010101010101)
+FILE_H  = np.uint64(0x8080808080808080)
 FILE_AB = np.uint64(0x0303030303030303)
 FILE_GH = np.uint64(0xC0C0C0C0C0C0C0C0)
 RANK_1  = np.uint64(0x00000000000000FF)
@@ -29,19 +29,18 @@ FULL    = np.uint64(0xFFFFFFFFFFFFFFFF)
 
 # =============================================================================
 # BOARD STATE (structured as a plain numpy array for Numba compatibility)
-# Layout: float64 array of length 24
-#   [0:12]  -> bitboards for each piece type (reinterpreted as uint64)
-#   [12]    -> occupancy WHITE  (uint64)
-#   [13]    -> occupancy BLACK  (uint64)
-#   [14]    -> occupancy ALL    (uint64)
-#   [15]    -> en passant square (int, 0-63, or 64 = none)
-#   [16]    -> castling rights   (uint8 bitmask packed into float)
+# Layout: uint64 array of length 20
+#   [0:12]  -> bitboards for each piece type
+#   [12]    -> occupancy WHITE
+#   [13]    -> occupancy BLACK
+#   [14]    -> occupancy ALL
+#   [15]    -> en passant square (0-63, or 64 = none)
+#   [16]    -> castling rights   (uint8 bitmask packed into uint64)
 #   [17]    -> side to move      (0 = white, 1 = black)
 #   [18]    -> halfmove clock
 #   [19]    -> fullmove number
 # =============================================================================
 
-# We store everything as uint64 views for Numba
 BOARD_SIZE = 20
 
 def make_board() -> np.ndarray:
@@ -64,15 +63,27 @@ def clear_bit(bb: uint64, sq: int) -> uint64:
 def get_bit(bb: uint64, sq: int) -> boolean:
     return (bb >> uint64(sq)) & uint64(1)
 
-# @njit(cache=True)
-# def lsb(bb: uint64) -> int:
-#     """Index of the least significant bit (lowest set square)."""
-#     return int(np.uint64(bb & (~bb + uint64(1))).bit_length() - 1) \
-#         if bb != uint64(0) else 64
 @njit(cache=True)
 def lsb(bb: uint64) -> int:
-    """Index of the least significant bit (0-63, or 64 if empty)."""
-    return np.cttz(bb) if bb != uint64(0) else 64
+    """
+    Index of the least significant bit (0-63), or 64 if bb == 0.
+
+    Uses the standard bit-trick:  bb & (-bb)  isolates the LSB, then
+    a 6-step bitmask ladder decodes the position in O(1).
+    Fully Numba @njit compatible — no NumPy intrinsics required.
+    """
+    if bb == uint64(0):
+        return 64
+    # isolate the lowest set bit  (unsigned: -x == ~x + 1)
+    isolated = bb & (~bb + uint64(1))
+    idx = 0
+    if isolated & uint64(0xFFFFFFFF00000000): idx += 32
+    if isolated & uint64(0xFFFF0000FFFF0000): idx += 16
+    if isolated & uint64(0xFF00FF00FF00FF00): idx += 8
+    if isolated & uint64(0xF0F0F0F0F0F0F0F0): idx += 4
+    if isolated & uint64(0xCCCCCCCCCCCCCCCC): idx += 2
+    if isolated & uint64(0xAAAAAAAAAAAAAAAA): idx += 1
+    return idx
 
 @njit(cache=True)
 def pop_lsb(bb: uint64):
@@ -82,7 +93,7 @@ def pop_lsb(bb: uint64):
 
 @njit(cache=True)
 def popcount(bb: uint64) -> int:
-    """Count number of set bits (Brian Kernighan)."""
+    """Count number of set bits (Brian Kernighan's algorithm)."""
     count = 0
     while bb:
         bb = bb & (bb - uint64(1))
@@ -133,26 +144,6 @@ def get_fullmove(board: uint64[:]) -> int:
 # BOARD MUTATORS (Numba JIT)
 # =============================================================================
 
-# @njit(cache=True)
-# def place_piece(board: uint64[:], piece: int, sq: int):
-#     """Place a piece on a square and update occupancy."""
-#     board[piece] = set_bit(board[piece], sq)
-#     if piece < 6:   # white
-#         board[12] = set_bit(board[12], sq)
-#     else:           # black
-#         board[13] = set_bit(board[13], sq)
-#     board[14] = board[12] | board[13]
-
-# @njit(cache=True)
-# def remove_piece(board: uint64[:], piece: int, sq: int):
-#     """Remove a piece from a square and update occupancy."""
-#     board[piece] = clear_bit(board[piece], sq)
-#     if piece < 6:
-#         board[12] = clear_bit(board[12], sq)
-#     else:
-#         board[13] = clear_bit(board[13], sq)
-#     board[14] = board[12] | board[13]
-
 @njit(cache=True)
 def place_piece(board: uint64[:], piece: int, sq: int):
     board[piece] = set_bit(board[piece], sq)
@@ -167,14 +158,6 @@ def remove_piece(board: uint64[:], piece: int, sq: int):
     board[occ_idx] = clear_bit(board[occ_idx], sq)
     board[14] = clear_bit(board[14], sq)
 
-# @njit(cache=True)
-# def piece_on(board: uint64[:], sq: int) -> int:
-#     """Return piece index (0-11) on square, or -1 if empty."""
-#     for p in range(12):
-#         if get_bit(board[p], sq):
-#             return p
-#     return -1
-
 @njit(cache=True)
 def piece_on(board: uint64[:], sq: int) -> int:
     """Return piece index (0-11) on square, or -1 if empty."""
@@ -186,10 +169,26 @@ def piece_on(board: uint64[:], sq: int) -> int:
     return -1
 
 # =============================================================================
-# FEN PARSER (pure Python — called once at startup, NOT in hot loop)
+# MOVE ENCODING
 # =============================================================================
 
-# Map FEN characters to piece indices
+# Encode a move into a single integer
+# Format: [4 bits promotion piece] [6 bits to_sq] [6 bits from_sq]
+@njit(cache=True)
+def encode_move(from_sq: int, to_sq: int, promo: int = 0) -> int:
+    return (promo << 12) | (to_sq << 6) | from_sq
+
+@njit(cache=True)
+def decode_move(move: int):
+    from_sq = move & 63
+    to_sq   = (move >> 6) & 63
+    promo   = (move >> 12) & 15
+    return from_sq, to_sq, promo
+
+# =============================================================================
+# FEN PARSER (pure Python — called once per position, NOT in hot loop)
+# =============================================================================
+
 _FEN_PIECE_MAP = {
     'P': W_PAWN,   'N': W_KNIGHT, 'B': W_BISHOP,
     'R': W_ROOK,   'Q': W_QUEEN,  'K': W_KING,
@@ -198,16 +197,10 @@ _FEN_PIECE_MAP = {
 }
 
 def board_from_fen(fen: str) -> np.ndarray:
-    """
-    Parse a FEN string into a board state array.
-    This is pure Python — only called once per position hand-off.
-    """
     board = make_board()
     parts = fen.strip().split()
 
-    # --- Piece placement ---
-    rank = 7
-    file = 0
+    rank, file = 7, 0
     for ch in parts[0]:
         if ch == '/':
             rank -= 1
@@ -216,14 +209,11 @@ def board_from_fen(fen: str) -> np.ndarray:
             file += int(ch)
         else:
             sq = rank * 8 + file
-            piece = _FEN_PIECE_MAP[ch]
-            place_piece(board, piece, sq)
+            place_piece(board, _FEN_PIECE_MAP[ch], sq)
             file += 1
 
-    # --- Side to move ---
     board[17] = np.uint64(0 if parts[1] == 'w' else 1)
 
-    # --- Castling rights ---
     castling = np.uint64(0)
     if parts[2] != '-':
         if 'K' in parts[2]: castling |= np.uint64(CASTLE_WK)
@@ -232,15 +222,13 @@ def board_from_fen(fen: str) -> np.ndarray:
         if 'q' in parts[2]: castling |= np.uint64(CASTLE_BQ)
     board[16] = castling
 
-    # --- En passant ---
     if parts[3] != '-':
         ep_file = ord(parts[3][0]) - ord('a')
         ep_rank = int(parts[3][1]) - 1
         board[15] = np.uint64(ep_rank * 8 + ep_file)
     else:
-        board[15] = np.uint64(64)   # sentinel = no EP
+        board[15] = np.uint64(64)
 
-    # --- Clocks ---
     board[18] = np.uint64(int(parts[4])) if len(parts) > 4 else np.uint64(0)
     board[19] = np.uint64(int(parts[5])) if len(parts) > 5 else np.uint64(1)
 
@@ -274,11 +262,11 @@ def board_to_fen(board: np.ndarray) -> str:
     side   = 'w' if board[17] == 0 else 'b'
     castle = ''
     c = int(board[16])
-    if c & CASTLE_WK: castle += 'K'
-    if c & CASTLE_WQ: castle += 'Q'
-    if c & CASTLE_BK: castle += 'k'
-    if c & CASTLE_BQ: castle += 'q'
-    if not castle:    castle  = '-'
+    if c & int(CASTLE_WK): castle += 'K'
+    if c & int(CASTLE_WQ): castle += 'Q'
+    if c & int(CASTLE_BK): castle += 'k'
+    if c & int(CASTLE_BQ): castle += 'q'
+    if not castle: castle = '-'
 
     ep = int(board[15])
     ep_str = '-' if ep == 64 else (chr(ord('a') + ep % 8) + str(ep // 8 + 1))
@@ -316,33 +304,15 @@ def print_board(board: np.ndarray):
     print(f"  Side: {'White' if board[17]==0 else 'Black'} | "
           f"EP: {int(board[15])} | Castling: {int(board[16]):04b}")
 
-# MORE HELPERS
+# =============================================================================
+# UCI HELPERS
+# =============================================================================
 
-
-# Convert 0-63 square index to UCI notation (e.g., 12 -> "e2")
 def sq_to_uci(sq: int) -> str:
-    file = chr(ord('a') + (sq % 8))
-    rank = str((sq // 8) + 1)
-    return f"{file}{rank}"
+    return chr(ord('a') + sq % 8) + str(sq // 8 + 1)
 
-# Convert UCI move notation to square index (e.g., "e2" -> 12)
 def uci_to_sq(uci: str) -> int:
-    file = ord(uci[0]) - ord('a')
-    rank = int(uci[1]) - 1
-    return rank * 8 + file
-
-# Encode a move into a single 16-bit int (efficient for Numba search)
-# Format: [4 bits promotion piece] [6 bits to_sq] [6 bits from_sq]
-@njit(cache=True)
-def encode_move(from_sq: int, to_sq: int, promo: int = 0) -> int:
-    return (promo << 12) | (to_sq << 6) | from_sq
-
-@njit(cache=True)
-def decode_move(move: int):
-    from_sq = move & 63
-    to_sq = (move >> 6) & 63
-    promo = (move >> 12) & 15
-    return from_sq, to_sq, promo
+    return (int(uci[1]) - 1) * 8 + (ord(uci[0]) - ord('a'))
 
 _PROMO_CHARS = {1: 'n', 2: 'b', 3: 'r', 4: 'q', 7: 'n', 8: 'b', 9: 'r', 10: 'q'}
 
