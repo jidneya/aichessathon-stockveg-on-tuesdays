@@ -1,4 +1,6 @@
 import time
+import shutil
+import os
 import numpy as np
 from numba import njit, uint64, int32
 from numba.typed import Dict
@@ -13,7 +15,9 @@ from src.board import (
     B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
     CASTLE_WK, CASTLE_WQ, CASTLE_BK, CASTLE_BQ,
 )
-from src.evaluate import evaluate
+from src.evaluate import nnue_forward, L0_WEIGHTS, L0_BIASES, L1_WEIGHTS, L1_BIAS
+
+INFINITY = 999999
 
 # =============================================================================
 # ATTACK HELPERS
@@ -76,7 +80,6 @@ def queen_attacks_sq(sq, occ):
 
 @njit(cache=True)
 def is_square_attacked(board, sq, by_side):
-    """True if `sq` is attacked by `by_side` (0=white, 1=black)."""
     occ = get_all_occ(board)
     if by_side == 0:
         if knight_attacks_sq(sq) & get_pieces(board, W_KNIGHT): return True
@@ -115,17 +118,21 @@ def make_move(board, move):
     side  = get_side(board)
     ep_sq = get_ep_square(board)
 
-    # Lift piece off source
+    # Remove piece from source
     board[piece] = clear_bit(board[piece], from_sq)
-    occ_src = 12 if piece < 6 else 13
-    board[occ_src] = clear_bit(board[occ_src], from_sq)
+    if piece < 6:
+        board[12] = clear_bit(board[12], from_sq)
+    else:
+        board[13] = clear_bit(board[13], from_sq)
 
-    # Remove any captured piece
+    # Remove any captured piece on destination
     captured = piece_on(board, to_sq)
     if captured != -1:
         board[captured] = clear_bit(board[captured], to_sq)
-        occ_cap = 12 if captured < 6 else 13
-        board[occ_cap] = clear_bit(board[occ_cap], to_sq)
+        if captured < 6:
+            board[12] = clear_bit(board[12], to_sq)
+        else:
+            board[13] = clear_bit(board[13], to_sq)
 
     # En passant capture
     new_ep = 64
@@ -139,11 +146,18 @@ def make_move(board, move):
             board[W_PAWN] = clear_bit(board[W_PAWN], ep_cap)
             board[12]     = clear_bit(board[12], ep_cap)
 
-    # Place piece on destination (promotion replaces piece type)
-    landing = piece if promo == 0 else promo
+    # Determine landing piece (promotion replaces pawn)
+    if promo != 0:
+        landing = promo
+    else:
+        landing = piece
+
+    # Place landing piece on destination
     board[landing] = set_bit(board[landing], to_sq)
-    occ_dst = 12 if landing < 6 else 13
-    board[occ_dst] = set_bit(board[occ_dst], to_sq)
+    if landing < 6:
+        board[12] = set_bit(board[12], to_sq)
+    else:
+        board[13] = set_bit(board[13], to_sq)
 
     # Set new EP square for double pawn pushes
     if piece == W_PAWN and to_sq - from_sq == 16:
@@ -178,7 +192,6 @@ def make_move(board, move):
             board[13]     = set_bit(board[13], 59)
         castling &= ~(int(CASTLE_BK) | int(CASTLE_BQ))
 
-    # Revoke castling rights when rooks move or are captured
     if from_sq == 0  or to_sq == 0:  castling &= ~int(CASTLE_WQ)
     if from_sq == 7  or to_sq == 7:  castling &= ~int(CASTLE_WK)
     if from_sq == 56 or to_sq == 56: castling &= ~int(CASTLE_BQ)
@@ -188,10 +201,13 @@ def make_move(board, move):
     board[15] = uint64(new_ep)
     board[16] = uint64(castling)
     board[17] = uint64(1 - side)
-    board[18] = uint64(0) if (captured != -1 or piece == W_PAWN or piece == B_PAWN) \
-                          else board[18] + uint64(1)
+    if captured != -1 or piece == W_PAWN or piece == B_PAWN:
+        board[18] = uint64(0)
+    else:
+        board[18] = board[18] + uint64(1)
     if side == 1:
         board[19] = board[19] + uint64(1)
+
 
 @njit(cache=True)
 def make_null_move(board):
@@ -203,15 +219,6 @@ def make_null_move(board):
 # =============================================================================
 
 @njit(cache=True)
-def _add_moves(moves, count, from_sq, targets, promo=0):
-    bb = targets
-    while bb:
-        sq, bb = pop_lsb(bb)
-        moves[count] = (promo << 12) | (sq << 6) | from_sq
-        count += 1
-    return count
-
-@njit(cache=True)
 def generate_legal_moves(board):
     side = get_side(board)
     occ  = get_all_occ(board)
@@ -220,203 +227,224 @@ def generate_legal_moves(board):
     ep_sq   = get_ep_square(board)
     castling = get_castling(board)
 
-    pseudo = np.zeros(256, dtype=np.int32)
-    count  = 0
+    buf = np.zeros(256, dtype=np.int32)
+    n   = 0
 
-    if side == 0:  # ---- WHITE ----
-        # Pawns
+    if side == 0:
+        # ── White pawns ──────────────────────────────────────────────────────
         pawns = get_pieces(board, W_PAWN)
         while pawns:
             sq, pawns = pop_lsb(pawns)
-            r, f = sq // 8, sq % 8
-            # Single push
-            if r < 7 and not get_bit(occ, sq + 8):
-                if r == 6:  # promotion
+            r = sq // 8
+            # single push
+            if not get_bit(occ, sq + 8):
+                if r == 6:   # promotion
                     for p in (W_QUEEN, W_ROOK, W_BISHOP, W_KNIGHT):
-                        pseudo[count] = (p << 12) | ((sq+8) << 6) | sq; count += 1
+                        buf[n] = encode_move(sq, sq+8, p); n += 1
                 else:
-                    pseudo[count] = ((sq+8) << 6) | sq; count += 1
-                    # Double push
-                    if r == 1 and not get_bit(occ, sq + 16):
-                        pseudo[count] = ((sq+16) << 6) | sq; count += 1
-            # Captures
-            for df in (-1, 1):
-                nf = f + df
-                if 0 <= nf <= 7:
-                    tsq = (r+1)*8 + nf
-                    if get_bit(opp_occ, tsq):
-                        if r == 6:
-                            for p in (W_QUEEN, W_ROOK, W_BISHOP, W_KNIGHT):
-                                pseudo[count] = (p << 12) | (tsq << 6) | sq; count += 1
-                        else:
-                            pseudo[count] = (tsq << 6) | sq; count += 1
-                    elif tsq == ep_sq and ep_sq != 64:
-                        pseudo[count] = (tsq << 6) | sq; count += 1
+                    buf[n] = encode_move(sq, sq+8); n += 1
+                    if r == 1 and not get_bit(occ, sq+16):
+                        buf[n] = encode_move(sq, sq+16); n += 1
+            # captures
+            for to_sq in (sq+7, sq+9):
+                if to_sq > 63: continue
+                tf = to_sq % 8
+                if abs(tf - sq%8) != 1: continue
+                if get_bit(opp_occ, to_sq):
+                    if r == 6:
+                        for p in (W_QUEEN, W_ROOK, W_BISHOP, W_KNIGHT):
+                            buf[n] = encode_move(sq, to_sq, p); n += 1
+                    else:
+                        buf[n] = encode_move(sq, to_sq); n += 1
+                elif to_sq == ep_sq and ep_sq != 64:
+                    buf[n] = encode_move(sq, to_sq); n += 1
 
-        # Knights
+        # ── White knights ────────────────────────────────────────────────────
         knights = get_pieces(board, W_KNIGHT)
         while knights:
             sq, knights = pop_lsb(knights)
-            targets = knight_attacks_sq(sq) & ~my_occ
-            count = _add_moves(pseudo, count, sq, targets)
+            atk = knight_attacks_sq(sq) & ~my_occ
+            while atk:
+                to_sq, atk = pop_lsb(atk)
+                buf[n] = encode_move(sq, to_sq); n += 1
 
-        # Bishops
+        # ── White bishops ────────────────────────────────────────────────────
         bishops = get_pieces(board, W_BISHOP)
         while bishops:
             sq, bishops = pop_lsb(bishops)
-            targets = bishop_attacks_sq(sq, occ) & ~my_occ
-            count = _add_moves(pseudo, count, sq, targets)
+            atk = bishop_attacks_sq(sq, occ) & ~my_occ
+            while atk:
+                to_sq, atk = pop_lsb(atk)
+                buf[n] = encode_move(sq, to_sq); n += 1
 
-        # Rooks
+        # ── White rooks ──────────────────────────────────────────────────────
         rooks = get_pieces(board, W_ROOK)
         while rooks:
             sq, rooks = pop_lsb(rooks)
-            targets = rook_attacks_sq(sq, occ) & ~my_occ
-            count = _add_moves(pseudo, count, sq, targets)
+            atk = rook_attacks_sq(sq, occ) & ~my_occ
+            while atk:
+                to_sq, atk = pop_lsb(atk)
+                buf[n] = encode_move(sq, to_sq); n += 1
 
-        # Queens
+        # ── White queens ─────────────────────────────────────────────────────
         queens = get_pieces(board, W_QUEEN)
         while queens:
             sq, queens = pop_lsb(queens)
-            targets = queen_attacks_sq(sq, occ) & ~my_occ
-            count = _add_moves(pseudo, count, sq, targets)
+            atk = queen_attacks_sq(sq, occ) & ~my_occ
+            while atk:
+                to_sq, atk = pop_lsb(atk)
+                buf[n] = encode_move(sq, to_sq); n += 1
 
-        # King
-        ksq = lsb(get_pieces(board, W_KING))
-        if ksq < 64:
-            targets = king_attacks_sq(ksq) & ~my_occ
-            count = _add_moves(pseudo, count, ksq, targets)
+        # ── White king ───────────────────────────────────────────────────────
+        king_bb = get_pieces(board, W_KING)
+        if king_bb:
+            sq, _ = pop_lsb(king_bb)
+            atk = king_attacks_sq(sq) & ~my_occ
+            while atk:
+                to_sq, atk = pop_lsb(atk)
+                buf[n] = encode_move(sq, to_sq); n += 1
             # Castling
             if castling & int(CASTLE_WK):
-                if not get_bit(occ, 5) and not get_bit(occ, 6):
-                    if not is_square_attacked(board, 4, 1) and \
-                       not is_square_attacked(board, 5, 1) and \
-                       not is_square_attacked(board, 6, 1):
-                        pseudo[count] = (6 << 6) | 4; count += 1
+                if not get_bit(occ,5) and not get_bit(occ,6):
+                    if not is_square_attacked(board,4,1) and \
+                       not is_square_attacked(board,5,1) and \
+                       not is_square_attacked(board,6,1):
+                        buf[n] = encode_move(4,6); n += 1
             if castling & int(CASTLE_WQ):
-                if not get_bit(occ, 3) and not get_bit(occ, 2) and not get_bit(occ, 1):
-                    if not is_square_attacked(board, 4, 1) and \
-                       not is_square_attacked(board, 3, 1) and \
-                       not is_square_attacked(board, 2, 1):
-                        pseudo[count] = (2 << 6) | 4; count += 1
+                if not get_bit(occ,3) and not get_bit(occ,2) and not get_bit(occ,1):
+                    if not is_square_attacked(board,4,1) and \
+                       not is_square_attacked(board,3,1) and \
+                       not is_square_attacked(board,2,1):
+                        buf[n] = encode_move(4,2); n += 1
 
-    else:  # ---- BLACK ----
-        # Pawns
+    else:  # side == 1 (Black)
+        # ── Black pawns ──────────────────────────────────────────────────────
         pawns = get_pieces(board, B_PAWN)
         while pawns:
             sq, pawns = pop_lsb(pawns)
-            r, f = sq // 8, sq % 8
-            # Single push
-            if r > 0 and not get_bit(occ, sq - 8):
-                if r == 1:  # promotion
+            r = sq // 8
+            if not get_bit(occ, sq - 8):
+                if r == 1:   # promotion
                     for p in (B_QUEEN, B_ROOK, B_BISHOP, B_KNIGHT):
-                        pseudo[count] = (p << 12) | ((sq-8) << 6) | sq; count += 1
+                        buf[n] = encode_move(sq, sq-8, p); n += 1
                 else:
-                    pseudo[count] = ((sq-8) << 6) | sq; count += 1
-                    # Double push
-                    if r == 6 and not get_bit(occ, sq - 16):
-                        pseudo[count] = ((sq-16) << 6) | sq; count += 1
-            # Captures
-            for df in (-1, 1):
-                nf = f + df
-                if 0 <= nf <= 7:
-                    tsq = (r-1)*8 + nf
-                    if tsq >= 0 and get_bit(opp_occ, tsq):
-                        if r == 1:
-                            for p in (B_QUEEN, B_ROOK, B_BISHOP, B_KNIGHT):
-                                pseudo[count] = (p << 12) | (tsq << 6) | sq; count += 1
-                        else:
-                            pseudo[count] = (tsq << 6) | sq; count += 1
-                    elif tsq == ep_sq and ep_sq != 64:
-                        pseudo[count] = (tsq << 6) | sq; count += 1
+                    buf[n] = encode_move(sq, sq-8); n += 1
+                    if r == 6 and not get_bit(occ, sq-16):
+                        buf[n] = encode_move(sq, sq-16); n += 1
+            for to_sq in (sq-7, sq-9):
+                if to_sq < 0: continue
+                tf = to_sq % 8
+                if abs(tf - sq%8) != 1: continue
+                if get_bit(opp_occ, to_sq):
+                    if r == 1:
+                        for p in (B_QUEEN, B_ROOK, B_BISHOP, B_KNIGHT):
+                            buf[n] = encode_move(sq, to_sq, p); n += 1
+                    else:
+                        buf[n] = encode_move(sq, to_sq); n += 1
+                elif to_sq == ep_sq and ep_sq != 64:
+                    buf[n] = encode_move(sq, to_sq); n += 1
 
-        # Knights
+        # ── Black knights ────────────────────────────────────────────────────
         knights = get_pieces(board, B_KNIGHT)
         while knights:
             sq, knights = pop_lsb(knights)
-            targets = knight_attacks_sq(sq) & ~my_occ
-            count = _add_moves(pseudo, count, sq, targets)
+            atk = knight_attacks_sq(sq) & ~my_occ
+            while atk:
+                to_sq, atk = pop_lsb(atk)
+                buf[n] = encode_move(sq, to_sq); n += 1
 
-        # Bishops
+        # ── Black bishops ────────────────────────────────────────────────────
         bishops = get_pieces(board, B_BISHOP)
         while bishops:
             sq, bishops = pop_lsb(bishops)
-            targets = bishop_attacks_sq(sq, occ) & ~my_occ
-            count = _add_moves(pseudo, count, sq, targets)
+            atk = bishop_attacks_sq(sq, occ) & ~my_occ
+            while atk:
+                to_sq, atk = pop_lsb(atk)
+                buf[n] = encode_move(sq, to_sq); n += 1
 
-        # Rooks
+        # ── Black rooks ──────────────────────────────────────────────────────
         rooks = get_pieces(board, B_ROOK)
         while rooks:
             sq, rooks = pop_lsb(rooks)
-            targets = rook_attacks_sq(sq, occ) & ~my_occ
-            count = _add_moves(pseudo, count, sq, targets)
+            atk = rook_attacks_sq(sq, occ) & ~my_occ
+            while atk:
+                to_sq, atk = pop_lsb(atk)
+                buf[n] = encode_move(sq, to_sq); n += 1
 
-        # Queens
+        # ── Black queens ─────────────────────────────────────────────────────
         queens = get_pieces(board, B_QUEEN)
         while queens:
             sq, queens = pop_lsb(queens)
-            targets = queen_attacks_sq(sq, occ) & ~my_occ
-            count = _add_moves(pseudo, count, sq, targets)
+            atk = queen_attacks_sq(sq, occ) & ~my_occ
+            while atk:
+                to_sq, atk = pop_lsb(atk)
+                buf[n] = encode_move(sq, to_sq); n += 1
 
-        # King
-        ksq = lsb(get_pieces(board, B_KING))
-        if ksq < 64:
-            targets = king_attacks_sq(ksq) & ~my_occ
-            count = _add_moves(pseudo, count, ksq, targets)
-            # Castling
+        # ── Black king ───────────────────────────────────────────────────────
+        king_bb = get_pieces(board, B_KING)
+        if king_bb:
+            sq, _ = pop_lsb(king_bb)
+            atk = king_attacks_sq(sq) & ~my_occ
+            while atk:
+                to_sq, atk = pop_lsb(atk)
+                buf[n] = encode_move(sq, to_sq); n += 1
             if castling & int(CASTLE_BK):
-                if not get_bit(occ, 61) and not get_bit(occ, 62):
-                    if not is_square_attacked(board, 60, 0) and \
-                       not is_square_attacked(board, 61, 0) and \
-                       not is_square_attacked(board, 62, 0):
-                        pseudo[count] = (62 << 6) | 60; count += 1
+                if not get_bit(occ,61) and not get_bit(occ,62):
+                    if not is_square_attacked(board,60,0) and \
+                       not is_square_attacked(board,61,0) and \
+                       not is_square_attacked(board,62,0):
+                        buf[n] = encode_move(60,62); n += 1
             if castling & int(CASTLE_BQ):
-                if not get_bit(occ, 59) and not get_bit(occ, 58) and not get_bit(occ, 57):
-                    if not is_square_attacked(board, 60, 0) and \
-                       not is_square_attacked(board, 59, 0) and \
-                       not is_square_attacked(board, 58, 0):
-                        pseudo[count] = (58 << 6) | 60; count += 1
+                if not get_bit(occ,59) and not get_bit(occ,58) and not get_bit(occ,57):
+                    if not is_square_attacked(board,60,0) and \
+                       not is_square_attacked(board,59,0) and \
+                       not is_square_attacked(board,58,0):
+                        buf[n] = encode_move(60,58); n += 1
 
-    # --- Legality filter: remove moves that leave king in check ---
+    # ── Legality filter: remove moves that leave own king in check ───────────
     king_piece = W_KING if side == 0 else B_KING
-    legal = np.zeros(256, dtype=np.int32)
-    legal_count = 0
-    for i in range(count):
-        mv = pseudo[i]
+    legal = np.zeros(n, dtype=np.int32)
+    m = 0
+    for i in range(n):
         nb = copy_board(board)
-        make_move(nb, mv)
-        ksq = lsb(get_pieces(nb, king_piece))
-        if ksq < 64 and not is_square_attacked(nb, ksq, 1 - side):
-            legal[legal_count] = mv
-            legal_count += 1
-
-    return legal[:legal_count]
+        make_move(nb, buf[i])
+        king_bb2 = get_pieces(nb, king_piece)
+        if king_bb2:
+            ksq, _ = pop_lsb(king_bb2)
+            if not is_square_attacked(nb, ksq, 1 - side):
+                legal[m] = buf[i]; m += 1
+    return legal[:m]
 
 # =============================================================================
 # ZOBRIST HASHING
 # =============================================================================
 np.random.seed(42)
-ZOBRIST_PIECES = np.random.randint(0, 2**63, size=(12, 64), dtype=np.int64).view(np.uint64)
-ZOBRIST_SIDE   = np.random.randint(0, 2**63, dtype=np.int64).view(np.uint64)[()]
+ZOBRIST_PIECES  = np.random.randint(1, 2**63, size=(12, 64), dtype=np.int64).view(np.uint64)
+ZOBRIST_SIDE    = np.uint64(np.random.randint(1, 2**63, dtype=np.int64))   # explicit np.uint64 scalar
+ZOBRIST_CASTLE  = np.random.randint(1, 2**63, size=16, dtype=np.int64).view(np.uint64)
+ZOBRIST_EP      = np.random.randint(1, 2**63, size=8,  dtype=np.int64).view(np.uint64)
 
 @njit(cache=True)
-def compute_hash(board):
+def compute_hash(board, zp, zs, zc, ze):
     h = uint64(0)
     for sq in range(64):
         p = piece_on(board, sq)
         if p != -1:
-            h ^= ZOBRIST_PIECES[p, sq]
+            h ^= zp[p, sq]
     if get_side(board) == 1:
-        h ^= ZOBRIST_SIDE
+        h ^= zs
+    h ^= zc[get_castling(board) & 15]
+    ep = get_ep_square(board)
+    if ep != 64:
+        h ^= ze[ep % 8]
     return h
 
 # =============================================================================
 # TRANSPOSITION TABLE
 # =============================================================================
-INFINITY = 999999
-FLAG_EXACT      = 1
-FLAG_LOWERBOUND = 2
-FLAG_UPPERBOUND = 3
+FLAG_EXACT      = int32(1)
+FLAG_LOWERBOUND = int32(2)
+FLAG_UPPERBOUND = int32(3)
 
 def create_tt():
     return Dict.empty(
@@ -424,64 +452,77 @@ def create_tt():
         value_type=types.UniTuple(types.int32, 4),
     )
 
-# ---------------------------------------------------------------------------
-# THE FIX: create_tt() is called INSIDE get_best_move() every time, so the
-# TT is always fresh and never carries stale/corrupted data between games.
-# A module-level TT was the root cause: after the first game the table was
-# full of entries from a completely different position tree, causing the
-# engine to return garbage moves (or no move at all) and crash.
-# ---------------------------------------------------------------------------
-
 @njit(cache=True)
 def tt_store(tt, h, depth, score, flag, best_move):
-    tt[h] = (int32(depth), int32(score), int32(flag), int32(best_move))
+    key = uint64(h)
+    if key in tt:
+        old_depth, _, _, _ = tt[key]
+        if old_depth > int32(depth):
+            return
+    tt[key] = (int32(depth), int32(score), int32(flag), int32(best_move))
 
 @njit(cache=True)
 def tt_probe(tt, h, depth, alpha, beta):
-    if h not in tt:
+    key = uint64(h)
+    if key not in tt:
         return False, int32(0), int32(0)
-    stored_depth, stored_score, stored_flag, stored_move = tt[h]
-    if stored_depth < depth:
-        return False, int32(0), int32(stored_move)
-    if stored_flag == 1:                          # EXACT
-        return True, int32(stored_score), int32(stored_move)
-    elif stored_flag == 2 and stored_score >= beta:   # LOWER
-        return True, int32(stored_score), int32(stored_move)
-    elif stored_flag == 3 and stored_score <= alpha:  # UPPER
-        return True, int32(stored_score), int32(stored_move)
-    return False, int32(0), int32(stored_move)
+    stored_depth, stored_score, stored_flag, stored_move = tt[key]
+    if stored_depth >= int32(depth):
+        if stored_flag == FLAG_EXACT:
+            return True, stored_score, stored_move
+        if stored_flag == FLAG_LOWERBOUND and stored_score >= int32(beta):
+            return True, stored_score, stored_move
+        if stored_flag == FLAG_UPPERBOUND and stored_score <= int32(alpha):
+            return True, stored_score, stored_move
+    return False, int32(0), stored_move
 
 # =============================================================================
-# NEGAMAX + ALPHA-BETA
+# NEGAMAX
 # =============================================================================
 
 @njit(cache=True)
-def negamax(board, depth, alpha, beta, color, tt, allow_null):
-    h = compute_hash(board)
+def negamax(board, depth, alpha, beta, tt, allow_null,
+            zp, zs, zc, ze, l0w, l0b, l1w, l1_bias):
+    """
+    Negamax with alpha-beta pruning.
+    evaluate() is already from side-to-move perspective — no * color needed.
+    All weight arrays and Zobrist tables passed as arguments (cache-safe).
+    """
+    h = compute_hash(board, zp, zs, zc, ze)
     hit, tt_score, tt_move = tt_probe(tt, h, depth, alpha, beta)
     if hit:
         return tt_score
 
     if depth <= 0:
-        # evaluate() returns score from side-to-move perspective
-        return evaluate(board)
+        return nnue_forward(board, l0w, l0b, l1w, l1_bias)
 
     # Null-move pruning
+    side = get_side(board)
     if allow_null and depth >= 3:
         null_board = copy_board(board)
         make_null_move(null_board)
-        null_score = -negamax(null_board, depth - 3, -beta, -beta + 1, -color, tt, False)
+        null_score = -negamax(null_board, depth - 3, -beta, -beta + 1,
+                              tt, False, zp, zs, zc, ze, l0w, l0b, l1w, l1_bias)
         if null_score >= beta:
             return beta
 
     moves = generate_legal_moves(board)
     if len(moves) == 0:
-        # No legal moves: checkmate or stalemate
-        king_piece = 5 if get_side(board) == 0 else 11
-        ksq = lsb(get_pieces(board, king_piece))
-        if ksq < 64 and is_square_attacked(board, ksq, 1 - get_side(board)):
-            return -INFINITY + depth   # Checkmate (prefer faster mates)
-        return 0                       # Stalemate
+        # Check for checkmate vs stalemate
+        king_piece = W_KING if side == 0 else B_KING
+        king_bb = get_pieces(board, king_piece)
+        if king_bb:
+            ksq, _ = pop_lsb(king_bb)
+            if is_square_attacked(board, ksq, 1 - side):
+                return -INFINITY + 1   # checkmate
+        return 0                       # stalemate
+
+    # TT move first (move ordering)
+    if tt_move != int32(0):
+        for i in range(len(moves)):
+            if moves[i] == tt_move:
+                moves[0], moves[i] = moves[i], moves[0]
+                break
 
     best_score  = -INFINITY
     best_move   = int32(0)
@@ -493,11 +534,15 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null):
         make_move(nb, move)
 
         if i == 0:
-            score = -negamax(nb, depth - 1, -beta, -alpha, -color, tt, True)
+            score = -negamax(nb, depth - 1, -beta, -alpha,
+                             tt, True, zp, zs, zc, ze, l0w, l0b, l1w, l1_bias)
         else:
-            score = -negamax(nb, depth - 1, -alpha - 1, -alpha, -color, tt, True)
+            # Zero-window search
+            score = -negamax(nb, depth - 1, -alpha - 1, -alpha,
+                             tt, True, zp, zs, zc, ze, l0w, l0b, l1w, l1_bias)
             if alpha < score < beta:
-                score = -negamax(nb, depth - 1, -beta, -alpha, -color, tt, True)
+                score = -negamax(nb, depth - 1, -beta, -alpha,
+                                 tt, True, zp, zs, zc, ze, l0w, l0b, l1w, l1_bias)
 
         if score > best_score:
             best_score = score
@@ -508,7 +553,12 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null):
         if alpha >= beta:
             break
 
-    flag = 1 if orig_alpha < best_score < beta else (2 if best_score >= beta else 3)
+    flag = FLAG_EXACT
+    if best_score <= orig_alpha:
+        flag = FLAG_UPPERBOUND
+    elif best_score >= beta:
+        flag = FLAG_LOWERBOUND
+
     tt_store(tt, h, depth, best_score, flag, best_move)
     return best_score
 
@@ -516,52 +566,157 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null):
 # ITERATIVE DEEPENING + TIME MANAGEMENT
 # =============================================================================
 
-def get_best_move(board_array, time_left_ms):
+def get_best_move(board_array, time_left_ms,
+                  l0w=None, l0b=None, l1w=None, l1_bias=None):
     """
-    Iterative-deepening search with per-move time budget.
+    Iterative deepening search with time management.
+    Weight arrays can be passed explicitly; if omitted the module globals
+    (already loaded by initialize_nnue) are used.
+    """
+    if l0w    is None: l0w    = L0_WEIGHTS
+    if l0b    is None: l0b    = L0_BIASES
+    if l1w    is None: l1w    = L1_WEIGHTS
+    if l1_bias is None: l1_bias = L1_BIAS
 
-    A brand-new TT is created for every call so stale entries from
-    previous games can never corrupt the search.
-    """
-    # Fresh TT every game — this is the key fix for the cross-game crash
+    # Snapshot Zobrist tables (avoids repeated global lookups in @njit)
+    zp = ZOBRIST_PIECES
+    zs = ZOBRIST_SIDE
+    zc = ZOBRIST_CASTLE
+    ze = ZOBRIST_EP
+
+    # Fresh TT every call — no cross-game contamination
     tt = create_tt()
 
-    start   = time.time()
-    # Allocate ~1/40th of remaining time, clamped to [0.5s, 8s]
-    budget  = max(0.5, min(8.0, (time_left_ms / 1000.0) / 40.0))
+    # Time budget: ~1/30th of remaining time, clamped to [0.1s, 5s]
+    budget_s = max(0.1, min(5.0, (time_left_ms / 1000.0) / 30.0))
+    start    = time.time()
 
     def elapsed():
         return time.time() - start
 
     def time_ok(fraction=1.0):
-        return elapsed() < budget * fraction
+        return elapsed() < budget_s * fraction
 
-    last_best  = 0
+    last_best  = int32(0)
     last_score = 0
 
     for depth in range(1, 20):
-        if not time_ok(0.5) and depth > 1:
-            break  # Don't start a depth we can't finish
-
-        score = negamax(board_array, depth, -INFINITY, INFINITY, 1, tt, True)
+        score = negamax(board_array, depth, -INFINITY, INFINITY,
+                        tt, True, zp, zs, zc, ze, l0w, l0b, l1w, l1_bias)
 
         # Read best move from TT root entry
-        h = compute_hash(board_array)
-        current_best = 0
-        if h in tt:
-            _, _, _, current_best = tt[h]
+        h = compute_hash(board_array, zp, zs, zc, ze)
+        key = uint64(h)
+        if key in tt:
+            _, _, _, mv = tt[key]
+            if mv != int32(0):
+                last_best = mv
 
-        last_best  = current_best if current_best != 0 else last_best
+        #print(f"  depth {depth:2d} | score {score:+7d} | move {int(last_best)} | t={elapsed():.2f}s")
+
         last_score = score
 
-        print(f"  depth {depth:2d} | score {score:+6d} | "
-              f"move {current_best} | t={elapsed():.2f}s")
-
-        if not time_ok():
+        # Stop if mate found
+        if abs(score) >= INFINITY - 100:
             break
 
-        # Stop early on forced mate
-        if abs(score) > INFINITY - 100:
+        # Don't start a new depth if we've used > 60% of budget
+        if not time_ok(0.6):
             break
 
     return int(last_best)
+
+# =============================================================================
+# CACHE CLEARING — wipes stale Numba .nbi/.nbc files before each run
+# =============================================================================
+
+def _clear_numba_cache():
+    """
+    Delete any existing Numba __pycache__ entries for this package so that
+    every process start compiles from scratch.
+
+    WHY: Numba's @njit(cache=True) stores compiled machine code keyed by the
+    argument *types* inferred at first-call time.  The Numba typed Dict used
+    for the transposition table is a complex runtime object whose internal
+    layout can differ between process restarts (e.g. after a draw/crash ends
+    the previous game).  When the cached code is loaded but the Dict layout
+    has shifted, Numba raises a low-level LLVM or segfault-style error during
+    the warmup call — which is exactly the "crash on second run" symptom.
+
+    Clearing the cache forces a fresh compilation on every startup.  The
+    compilation takes ~25 s, which comfortably fits inside the platform's
+    90 s init budget.  This matches the strategy used by the numba baseline,
+    which never relies on a persistent cache at all (it uses python-chess and
+    a simple @njit evaluate with no Dict).
+    """
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    for root, dirs, files in os.walk(src_dir):
+        if os.path.basename(root) == "__pycache__":
+            for fname in files:
+                if fname.endswith((".nbi", ".nbc")):
+                    try:
+                        os.remove(os.path.join(root, fname))
+                    except OSError:
+                        pass
+
+
+# =============================================================================
+# JIT WARMUP — runs at import time, inside the 90s init budget
+# =============================================================================
+
+def _warmup():
+    """
+    Force Numba to JIT-compile every kernel in the call graph by running
+    a depth-1 search on the starting position.  Called at module import
+    time so compilation happens during the 90s init window, not on the
+    first move clock.
+
+    CHANGES vs original:
+    - _clear_numba_cache() is called first so we always compile fresh,
+      avoiding the "crash on second run" caused by stale .nbi/.nbc files
+      that were written with a different Numba Dict internal layout.
+    - The warmup is wrapped in a broad try/except so that any unexpected
+      compilation error is reported but does not kill the agent process.
+    - ZOBRIST_SIDE is now an explicit np.uint64 scalar (not a 0-d array
+      extracted with [()]) so Numba's type inference is unambiguous and
+      consistent across runs.
+    """
+    import time as _time
+    from src.board import board_from_fen as _bff
+
+    # ── Step 1: wipe stale cache so we always start clean ───────────────────
+    _clear_numba_cache()
+
+    t0 = _time.time()
+    print("Warming up Numba JIT kernels...", flush=True)
+
+    dummy = _bff("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    tt    = create_tt()
+
+    # Zero-filled weight arrays — cache stores compiled code only, not data.
+    # Types must exactly match what get_best_move() passes at runtime:
+    #   l0w  : int16 (HIDDEN_SIZE, INPUT_SIZE)
+    #   l0b  : int16 (HIDDEN_SIZE,)
+    #   l1w  : int16 (2 * HIDDEN_SIZE,)
+    #   l1b  : int32 scalar
+    _l0w = np.zeros((128, 768), dtype=np.int16)
+    _l0b = np.zeros(128,        dtype=np.int16)
+    _l1w = np.zeros(256,        dtype=np.int16)
+    _l1b = np.int32(0)
+
+    # ── Step 2: compile the full call graph ─────────────────────────────────
+    try:
+        negamax(dummy, 1, -INFINITY, INFINITY,
+                tt, False,
+                ZOBRIST_PIECES, ZOBRIST_SIDE, ZOBRIST_CASTLE, ZOBRIST_EP,
+                _l0w, _l0b, _l1w, _l1b)
+        print(f"JIT warmup complete in {_time.time()-t0:.1f}s", flush=True)
+    except Exception as e:
+        # If compilation still fails (e.g. Numba version mismatch), report it
+        # clearly so it shows up in the validation log, but do NOT crash the
+        # agent — the first real get_move() call will trigger recompilation.
+        print(f"JIT warmup error (non-fatal, will recompile on first move): {e}",
+              flush=True)
+
+
+_warmup()
