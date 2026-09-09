@@ -533,10 +533,10 @@ def negamax(
     hist_len,    # int32 — number of real game hashes in hist
 ):
     # ── Repetition detection (skip at root) ──────────────────────────────────
-    h = compute_hash(board, zp, zs, zc, ze)   # guaranteed uint64
+    h = compute_hash(board, zp, zs, zc, ze)
 
     if ply >= int32(1):
-        if count_hash_in_history(h, hist, hist_len + ply) >= int32(2):
+        if count_hash_in_history(h, hist, hist_len + ply) >= int32(1):
             return CONTEMPT
 
     # ── TT probe ─────────────────────────────────────────────────────────────
