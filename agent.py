@@ -230,5 +230,6 @@ def get_move(fen: str, time_left_ms: int) -> str:
     _game_history.append(current_hash)
 
     uci = _move_int_to_uci(int(move_int))
+    print(f"Current position: {fen}", file=sys.stderr)
     print(f"Best move: {uci}", file=sys.stderr)
     return uci
