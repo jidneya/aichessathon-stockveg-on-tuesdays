@@ -4,6 +4,8 @@ import os
 import numpy as np
 import chess
 import chess.syzygy
+from src.board import copy_board
+from src.search import make_move
 
 # ---------------------------------------------------------------------------
 # Step 1: Initialise NNUE weights FIRST (search imports evaluate)
@@ -289,8 +291,18 @@ def get_move(fen: str, time_left_ms: int) -> str:
         compute_hash(board, ZOBRIST_PIECES, ZOBRIST_SIDE, ZOBRIST_CASTLE, ZOBRIST_EP)
     )
 
-    move_int = get_best_move(board, time_left_ms, game_hist=_game_history)
+    # ADD root hash BEFORE search so the search tree knows where it started
     _game_history.append(current_hash)
+
+    move_int = get_best_move(board, time_left_ms, game_hist=_game_history)
+
+    # Apply the move and ADD the opponent's turn hash to history
+    child = copy_board(board)
+    make_move(child, move_int)
+    post_move_hash = np.uint64(
+        compute_hash(child, ZOBRIST_PIECES, ZOBRIST_SIDE, ZOBRIST_CASTLE, ZOBRIST_EP)
+    )
+    _game_history.append(post_move_hash)
 
     uci = _move_int_to_uci(int(move_int))
     print(f"Best move: {uci}", file=sys.stderr)
