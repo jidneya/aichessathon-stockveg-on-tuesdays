@@ -534,18 +534,47 @@ def negamax(
         if null_score >= beta:
             return beta
 
-    # ── Move ordering: TT move first, then captures ───────────────────────────
-    ordered = []
-    rest    = []
-    for mv in moves:
-        if mv == tt_move and tt_move != int32(0):
-            ordered.append(mv)
-        elif piece_on(board, (mv >> 6) & 63) != -1:
-            ordered.append(mv)
-        else:
-            rest.append(mv)
-    ordered.extend(rest)
+    # ── Move ordering: TT move -> MVV-LVA Captures / Promos -> Quiets ────────
+    scores = np.zeros(len(moves), dtype=np.int32)
+    # Piece values for MVV-LVA: P=100, N=320, B=330, R=500, Q=900, K=20000
+    VALS = (100, 320, 330, 500, 900, 20000, 100, 320, 330, 500, 900, 20000)
 
+    for idx in range(len(moves)):
+        mv = moves[idx]
+        if mv == tt_move and tt_move != int32(0):
+            scores[idx] = int32(100000)
+            continue
+
+        to_sq   = (mv >> 6) & 63
+        from_sq = mv & 63
+        promo   = (mv >> 12) & 15
+        victim  = piece_on(board, to_sq)
+        attacker = piece_on(board, from_sq)
+
+        score = int32(0)
+        # Queen promotions
+        if promo == W_QUEEN or promo == B_QUEEN:
+            score += int32(9000)
+
+        # MVV-LVA: 10 * Victim - Attacker
+        if victim != -1 and attacker != -1:
+            score += int32(VALS[victim] * 10 - VALS[attacker])
+
+        scores[idx] = score
+
+    # In-place insertion sort (fastest for Numba small lists <= 60 items)
+    for i in range(1, len(moves)):
+        key_move = moves[i]
+        key_score = scores[i]
+        j = i - 1
+        while j >= 0 and scores[j] < key_score:
+            moves[j + 1] = moves[j]
+            scores[j + 1] = scores[j]
+            j -= 1
+        moves[j + 1] = key_move
+        scores[j + 1] = key_score
+
+    ordered = moves
     # ── Write current hash into hist scratch area ─────────────────────────────
     hist[hist_len + ply] = h
 
