@@ -107,8 +107,8 @@ _QUEEN_W = [
 
 # ── King — middlegame ─────────────────────────────────────────────────────────
 _KING_MG_W = [
-    20, 30, 10,  0,  0, 10, 30, 20,   # rank 1
-    20, 20,  0,  0,  0,  0, 20, 20,   # rank 2
+    20, 30, 20, 20, 20, 20, 30, 20,   # rank 1 (flattened centre)
+    20, 20,  0,  0,  0,  0, 20, 20,   # rank 2 (discourage stepping up)
    -10,-20,-20,-20,-20,-20,-20,-10,   # rank 3
    -20,-30,-30,-40,-40,-30,-30,-20,   # rank 4
    -30,-40,-40,-50,-50,-40,-40,-30,   # rank 5
@@ -280,24 +280,15 @@ def nnue_forward(
 @njit(cache=True)
 def pst_score(board, pst: np.ndarray) -> int32:
     """
-    Compute PST score from side-to-move's perspective.
-
-    Piece indices:
-      White: 0=P 1=N 2=B 3=R 4=Q 5=K
-      Black: 6=P 7=N 8=B 9=R 10=Q 11=K
-
-    PST rows:
-      0-5  : White pieces (rows match piece index directly)
-      6-11 : Black pieces (rows match piece index directly)
-      12   : White King EG
-      13   : Black King EG
-
-    Endgame condition: total non-pawn material ≤ 1300 cp
+    Compute PST score + Material Base Value from side-to-move's perspective.
     """
-    # ── Material values for endgame detection ─────────────────────────────────
-    # N=320, B=330, R=500, Q=900
+    # ── Material values for endgame detection (pawns excluded) ────────────────
     MAT = (int32(0), int32(320), int32(330), int32(500), int32(900), int32(0),
            int32(0), int32(320), int32(330), int32(500), int32(900), int32(0))
+
+    # ── Base material values for evaluation (pawns included) ──────────────────
+    BASE_VALS = (int32(100), int32(320), int32(330), int32(500), int32(900), int32(0),
+                 int32(100), int32(320), int32(330), int32(500), int32(900), int32(0))
 
     total_mat = int32(0)
     for p in range(12):
@@ -313,7 +304,6 @@ def pst_score(board, pst: np.ndarray) -> int32:
     is_endgame = total_mat <= int32(1300)
 
     side = int(board[17])   # 0=White, 1=Black
-
     score = int32(0)
 
     for piece in range(12):
@@ -338,10 +328,10 @@ def pst_score(board, pst: np.ndarray) -> int32:
             else:
                 row = piece   # rows 0-4 for White, 6-10 for Black
 
-            val = pst[row, sq_i]
+            # Add BOTH the base material value and the positional PST value
+            val = pst[row, sq_i] + BASE_VALS[piece]
 
             # White pieces add positively, Black pieces subtract
-            # (score is from White's perspective, flipped at end if Black to move)
             if piece < 6:
                 score += val
             else:
@@ -352,7 +342,6 @@ def pst_score(board, pst: np.ndarray) -> int32:
         score = -score
 
     return score
-
 
 @njit(cache=True)
 def evaluate(
