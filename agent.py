@@ -1,6 +1,9 @@
 import sys
 import random
+import os
 import numpy as np
+import chess
+import chess.syzygy
 
 # ---------------------------------------------------------------------------
 # Step 1: Initialise NNUE weights FIRST (search imports evaluate)
@@ -24,9 +27,65 @@ from src.search import (
 )
 
 # ---------------------------------------------------------------------------
-# Step 3: JIT warmup (compiles all Numba kernels inside the init budget)
+# Step 3: JIT warmup
 # ---------------------------------------------------------------------------
 warmup()
+
+# ---------------------------------------------------------------------------
+# SYZYGY TABLEBASE READER
+# ---------------------------------------------------------------------------
+SYZYGY_PATH = os.path.join(os.path.dirname(__file__), "src", "assets", "syzygy")
+tablebase = None
+if os.path.isdir(SYZYGY_PATH):
+    try:
+        tablebase = chess.syzygy.open_tablebase(SYZYGY_PATH)
+        print("Syzygy tablebase initialized.")
+    except Exception as e:
+        print(f"Failed to load Syzygy: {e}")
+
+def _probe_syzygy_root(fen: str) -> str | None:
+    """Probes Syzygy DTZ/WDL at the root for optimal endgame conversion."""
+    if not tablebase:
+        return None
+
+    board = chess.Board(fen)
+    if chess.popcount(board.occupied) > 5:
+        return None
+
+    best_move = None
+    best_dtz = 999999
+    best_wdl = -999999
+
+    try:
+        # Check DTZ first (finds shortest path to mate / pawn reset)
+        for move in board.legal_moves:
+            board.push(move)
+            dtz = -tablebase.probe_dtz(board)
+            board.pop()
+
+            if dtz > 0 and dtz < best_dtz:
+                best_dtz = dtz
+                best_move = move
+
+        if best_move:
+            return best_move.uci()
+
+        # Fallback to WDL if all moves are drawing or losing
+        for move in board.legal_moves:
+            board.push(move)
+            wdl = -tablebase.probe_wdl(board)
+            board.pop()
+
+            if wdl > best_wdl:
+                best_wdl = wdl
+                best_move = move
+
+        if best_move:
+            return best_move.uci()
+    except Exception:
+        return None
+
+    return None
 
 # ---------------------------------------------------------------------------
 # OPENING BOOK
@@ -199,37 +258,40 @@ def get_move(fen: str, time_left_ms: int) -> str:
     _last_fullmove = fullmove
     _last_side     = side
 
-    # ── Trim history to last 100 entries (50-move rule) ───────────────────────
     if len(_game_history) > 100:
         _game_history = _game_history[-100:]
 
-    print(f"Searching position: {fen[:60]}...")
-    print(f"Time remaining: {time_left_ms}ms")
-    print(f"History depth: {len(_game_history)} positions")
+    # ── 1. Opening book lookup ────────────────────────────────────────────────
+    book_move = _book_lookup(fen)
+    if book_move:
+        print(f"Book move: {book_move}")
+        board = board_from_fen(fen)
+        current_hash = np.uint64(
+            compute_hash(board, ZOBRIST_PIECES, ZOBRIST_SIDE, ZOBRIST_CASTLE, ZOBRIST_EP)
+        )
+        _game_history.append(current_hash)
+        return book_move
 
-    # ── Build board ───────────────────────────────────────────────────────────
+    # ── 2. Syzygy Endgame Tablebase lookup ────────────────────────────────────
+    syzygy_move = _probe_syzygy_root(fen)
+    if syzygy_move:
+        print(f"Syzygy endgame move: {syzygy_move}")
+        board = board_from_fen(fen)
+        current_hash = np.uint64(
+            compute_hash(board, ZOBRIST_PIECES, ZOBRIST_SIDE, ZOBRIST_CASTLE, ZOBRIST_EP)
+        )
+        _game_history.append(current_hash)
+        return syzygy_move
+
+    # ── 3. Fallback to Numba Search Engine ─────────────────────────────────────
     board = board_from_fen(fen)
-
-    # ── Compute current position hash ─────────────────────────────────────────
     current_hash = np.uint64(
         compute_hash(board, ZOBRIST_PIECES, ZOBRIST_SIDE, ZOBRIST_CASTLE, ZOBRIST_EP)
     )
 
-    # ── Opening book lookup ───────────────────────────────────────────────────
-    book_move = _book_lookup(fen)
-    if book_move:
-        print(f"Book move: {book_move}")
-        # Still record hash for repetition tracking
-        _game_history.append(current_hash)
-        return book_move
-
-    # ── Search ────────────────────────────────────────────────────────────────
     move_int = get_best_move(board, time_left_ms, game_hist=_game_history)
-
-    # ── Record hash AFTER search (never before — prevents a1a1 bug) ───────────
     _game_history.append(current_hash)
 
     uci = _move_int_to_uci(int(move_int))
-    print(f"Current position: {fen}", file=sys.stderr)
     print(f"Best move: {uci}", file=sys.stderr)
     return uci
