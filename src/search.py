@@ -16,10 +16,11 @@ from src.board import (
 )
 from src.evaluate import (
     nnue_forward, evaluate,
-    L0_WEIGHTS, L0_BIASES, L1_WEIGHTS, L1_BIAS,
     PST_TABLE,
     QA, QB, SCALE,
 )
+import src.evaluate as ev  # Dynamic module reference
+
 
 INFINITY = 999999
 CONTEMPT = np.int32(-10)
@@ -720,7 +721,7 @@ def get_best_move(board, time_left_ms: int, game_hist: list) -> int:
                 child, int32(depth - 1), -beta, -alpha, int32(1),
                 tt,
                 ZOBRIST_PIECES, ZOBRIST_SIDE, ZOBRIST_CASTLE, ZOBRIST_EP,
-                L0_WEIGHTS, L0_BIASES, L1_WEIGHTS, L1_BIAS,
+                ev.L0_WEIGHTS, ev.L0_BIASES, ev.L1_WEIGHTS, ev.L1_BIAS,
                 QA, QB, SCALE,
                 PST_TABLE,
                 hist, hist_len,
@@ -762,6 +763,9 @@ def warmup():
     _clear_numba_cache()
     t0 = time.time()
 
+    import src.evaluate as ev
+    ev.initialize_nnue()
+    
     from src.board import board_from_fen
     dummy = board_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
 
@@ -776,7 +780,7 @@ def warmup():
             dummy, int32(1), int32(-INFINITY), int32(INFINITY), int32(0),
             tt,
             ZOBRIST_PIECES, ZOBRIST_SIDE, ZOBRIST_CASTLE, ZOBRIST_EP,
-            L0_WEIGHTS, L0_BIASES, L1_WEIGHTS, L1_BIAS,
+            ev.L0_WEIGHTS, ev.L0_BIASES, ev.L1_WEIGHTS, ev.L1_BIAS,
             QA, QB, SCALE,
             PST_TABLE,
             hist, hist_len,
