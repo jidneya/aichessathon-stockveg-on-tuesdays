@@ -129,22 +129,39 @@ _KING_EG_W = [
    -50,-30,-30,-30,-30,-30,-30,-50,   # rank 8
 ]
 
+# ── Pawn — endgame ────────────────────────────────────────────────────────────
+_PAWN_EG_W = [
+     0,  0,  0,  0,  0,  0,  0,  0,   # rank 1
+   -10,-10,-10,-10,-10,-10,-10,-10,   # rank 2 (punish un-pushed pawns)
+   -10,-10,  0,  0,  0,  0,-10,-10,   # rank 3
+     0,  0, 10, 20, 20, 10,  0,  0,   # rank 4
+    20, 20, 30, 40, 40, 30, 20, 20,   # rank 5 (reward advancing)
+    60, 60, 70, 80, 80, 70, 60, 60,   # rank 6 (very dangerous)
+   120,120,120,120,120,120,120,120,   # rank 7 (almost a queen, must push)
+     0,  0,  0,  0,  0,  0,  0,  0,   # rank 8
+]
 
 def _build_pst() -> np.ndarray:
     """
-    Returns shape (14, 64) int32 array.
-    Rows 0-5  : White  Pawn/Knight/Bishop/Rook/Queen/King-MG
-    Rows 6-11 : Black  (vertical mirror of White rows 0-5)
+    Returns shape (16, 64) int32 array.
+    Rows 0-5  : White  P, N, B, R, Q, K-MG
+    Rows 6-11 : Black  P, N, B, R, Q, K-MG
     Row  12   : White King-EG
     Row  13   : Black King-EG
+    Row  14   : White Pawn-EG
+    Row  15   : Black Pawn-EG
     """
     tables_w = [_PAWN_W, _KNIGHT_W, _BISHOP_W, _ROOK_W, _QUEEN_W, _KING_MG_W]
-    pst = np.zeros((14, 64), dtype=np.int32)
+    pst = np.zeros((16, 64), dtype=np.int32)
     for i, t in enumerate(tables_w):
         pst[i]     = np.array(t,          dtype=np.int32)
         pst[i + 6] = np.array(_mirror(t), dtype=np.int32)
+    
     pst[12] = np.array(_KING_EG_W,          dtype=np.int32)
     pst[13] = np.array(_mirror(_KING_EG_W), dtype=np.int32)
+    pst[14] = np.array(_PAWN_EG_W,          dtype=np.int32)
+    pst[15] = np.array(_mirror(_PAWN_EG_W), dtype=np.int32)
+    
     return pst
 
 
@@ -321,12 +338,16 @@ def pst_score(board, pst: np.ndarray) -> int32:
             sq_i = int(sq)
 
             # Determine PST row
-            if piece == 5:   # White King
+            if piece == 5:     # White King
                 row = 12 if is_endgame else 5
             elif piece == 11:  # Black King
                 row = 13 if is_endgame else 11
+            elif piece == 0:   # White Pawn
+                row = 14 if is_endgame else 0
+            elif piece == 6:   # Black Pawn
+                row = 15 if is_endgame else 6
             else:
-                row = piece   # rows 0-4 for White, 6-10 for Black
+                row = piece    # rows 1-4 for White, 7-10 for Black
 
             # Add BOTH the base material value and the positional PST value
             val = pst[row, sq_i] + BASE_VALS[piece]
