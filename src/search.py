@@ -466,6 +466,58 @@ def tt_unpack(entry: np.int64):
     m = np.int32((entry >> np.int64(26)) & np.int64(0xFFFF))
     return s, d, f, m
 
+@njit(cache=True)
+def quiescence(board, alpha, beta, ply, w0, b0, w1, b1, qa, qb, scale, pst):
+    """Searches captures beyond depth 0 to resolve tactical instability."""
+    stand_pat = evaluate(board, w0, b0, w1, b1, qa, qb, scale, pst)
+    if stand_pat >= beta:
+        return beta
+    if alpha < stand_pat:
+        alpha = stand_pat
+
+    moves = generate_legal_moves(board)
+    captures = []
+    
+    # Filter only captures
+    for mv in moves:
+        to_sq = (mv >> 6) & 63
+        if piece_on(board, to_sq) != -1:
+            captures.append(mv)
+
+    # MVV-LVA for captures only
+    scores = np.zeros(len(captures), dtype=np.int32)
+    VALS = (100, 320, 330, 500, 900, 20000, 100, 320, 330, 500, 900, 20000)
+    for idx in range(len(captures)):
+        mv = captures[idx]
+        to_sq = (mv >> 6) & 63
+        from_sq = mv & 63
+        victim = piece_on(board, to_sq)
+        attacker = piece_on(board, from_sq)
+        scores[idx] = int32(VALS[victim] * 10 - VALS[attacker])
+
+    # Insertion sort
+    for i in range(1, len(captures)):
+        key_move = captures[i]
+        key_score = scores[i]
+        j = i - 1
+        while j >= 0 and scores[j] < key_score:
+            captures[j + 1] = captures[j]
+            scores[j + 1] = scores[j]
+            j -= 1
+        captures[j + 1] = key_move
+        scores[j + 1] = key_score
+
+    for mv in captures:
+        child = copy_board(board)
+        make_move(child, mv)
+        score = -quiescence(child, -beta, -alpha, ply + int32(1), w0, b0, w1, b1, qa, qb, scale, pst)
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
+
+    return alpha
+
 # =============================================================================
 # NEGAMAX WITH ALPHA-BETA, PVS, NULL-MOVE, REPETITION DETECTION
 # =============================================================================
@@ -517,7 +569,8 @@ def negamax(
         return int32(0)   # stalemate
 
     if depth <= int32(0):
-        return evaluate(board, w0, b0, w1, b1, qa, qb, scale, pst)
+        # This replaces evaluate() with quiescence() to prevent opening blunder
+        return quiescence(board, alpha, beta, ply, w0, b0, w1, b1, qa, qb, scale, pst)
 
     # ── Null-move pruning ─────────────────────────────────────────────────────
     if depth >= int32(3) and ply > int32(0):
