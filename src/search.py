@@ -556,18 +556,8 @@ def negamax(
             if alpha >= beta:
                 return tt_score
 
-    # ── Terminal / leaf ───────────────────────────────────────────────────────
-    moves = generate_legal_moves(board)
-
-    if len(moves) == 0:
-        side = get_side(board)
-        king_piece = W_KING if side == 0 else B_KING
-        king_bb = get_pieces(board, king_piece)
-        if king_bb != uint64(0):
-            king_sq = lsb(king_bb)
-            if is_square_attacked(board, king_sq, 1 - side):
-                return int32(-INFINITY + ply)   # checkmate
-        return int32(0)   # stalemate
+# ── Terminal / leaf ───────────────────────────────────────────────────────
+    moves = generate_moves(board)  # Fetch PSEUDO moves to save time
 
     if depth <= int32(0):
         # This replaces evaluate() with quiescence() to prevent opening blunder
@@ -576,10 +566,8 @@ def negamax(
     # ── Null-move pruning ─────────────────────────────────────────────────────
     if depth >= int32(3) and ply > int32(0):
         null_board = copy_board(board)
-        null_board[17] ^= 1   # FIX: flip side to move without moving a piece
-                               # (was erroneously board[14], the ALL-occupancy
-                               # bitboard, instead of board[17])
-        null_board[15]  = 64  # clear ep
+        null_board[17] ^= 1   
+        null_board[15]  = 64  
         null_score = -negamax(
             null_board, depth - int32(3), -beta, -beta + int32(1), ply + int32(1),
             tt, zp, zs, zc, ze, w0, b0, w1, b1, qa, qb, scale, pst,
@@ -588,66 +576,46 @@ def negamax(
         if null_score >= beta:
             return beta
 
-    # ── Move ordering: TT move -> MVV-LVA Captures / Promos -> Quiets ────────
-    scores = np.zeros(len(moves), dtype=np.int32)
-    # Piece values for MVV-LVA: P=100, N=320, B=330, R=500, Q=900, K=20000
-    VALS = (100, 320, 330, 500, 900, 20000, 100, 320, 330, 500, 900, 20000)
-
-    for idx in range(len(moves)):
-        mv = moves[idx]
+    # ── Move ordering: TT move first, then captures ───────────────────────────
+    ordered = []
+    rest    = []
+    for mv in moves:
         if mv == tt_move and tt_move != int32(0):
-            scores[idx] = int32(100000)
-            continue
+            ordered.append(mv)
+        elif piece_on(board, (mv >> 6) & 63) != -1:
+            ordered.append(mv)
+        else:
+            rest.append(mv)
+    ordered.extend(rest)
 
-        to_sq   = (mv >> 6) & 63
-        from_sq = mv & 63
-        promo   = (mv >> 12) & 15
-        victim  = piece_on(board, to_sq)
-        attacker = piece_on(board, from_sq)
-
-        score = int32(0)
-        # Queen promotions
-        if promo == W_QUEEN or promo == B_QUEEN:
-            score += int32(9000)
-
-        # MVV-LVA: 10 * Victim - Attacker
-        if victim != -1 and attacker != -1:
-            score += int32(VALS[victim] * 10 - VALS[attacker])
-
-        scores[idx] = score
-
-    # In-place insertion sort (fastest for Numba small lists <= 60 items)
-    for i in range(1, len(moves)):
-        key_move = moves[i]
-        key_score = scores[i]
-        j = i - 1
-        while j >= 0 and scores[j] < key_score:
-            moves[j + 1] = moves[j]
-            scores[j + 1] = scores[j]
-            j -= 1
-        moves[j + 1] = key_move
-        scores[j + 1] = key_score
-
-    ordered = moves
     # ── Write current hash into hist scratch area ─────────────────────────────
     hist[hist_len + ply] = h
 
     best_score = int32(-INFINITY)
     best_move  = int32(0)
     flag       = TT_UPPER
+    legal_played = 0
 
-    for i, mv in enumerate(ordered):
+    for mv in ordered:
         child = copy_board(board)
         make_move(child, mv)
 
-        if i == 0:
+        # Inline legality check (prevents double-copying the board)
+        side = get_side(board)
+        king_piece = W_KING if side == 0 else B_KING
+        king_bb = get_pieces(child, king_piece)
+        if king_bb != uint64(0):
+            king_sq = lsb(king_bb)
+            if is_square_attacked(child, king_sq, 1 - side):
+                continue  # Move was illegal, skip it
+
+        if legal_played == 0:
             score = -negamax(
                 child, depth - int32(1), -beta, -alpha, ply + int32(1),
                 tt, zp, zs, zc, ze, w0, b0, w1, b1, qa, qb, scale, pst,
                 hist, hist_len,
             )
         else:
-            # PVS zero-window search
             score = -negamax(
                 child, depth - int32(1), -alpha - int32(1), -alpha, ply + int32(1),
                 tt, zp, zs, zc, ze, w0, b0, w1, b1, qa, qb, scale, pst,
@@ -659,6 +627,8 @@ def negamax(
                     tt, zp, zs, zc, ze, w0, b0, w1, b1, qa, qb, scale, pst,
                     hist, hist_len,
                 )
+
+        legal_played += 1
 
         if score > best_score:
             best_score = score
@@ -672,6 +642,17 @@ def negamax(
             flag = TT_LOWER
             break
 
+    # If no moves were legal, it is checkmate or stalemate
+    if legal_played == 0:
+        side = get_side(board)
+        king_piece = W_KING if side == 0 else B_KING
+        king_bb = get_pieces(board, king_piece)
+        if king_bb != uint64(0):
+            king_sq = lsb(king_bb)
+            if is_square_attacked(board, king_sq, 1 - side):
+                return int32(-INFINITY + ply)
+        return int32(0)
+    
     # ── Store in TT ───────────────────────────────────────────────────────────
     tt[h] = tt_pack(best_score, depth, flag, best_move)
 
