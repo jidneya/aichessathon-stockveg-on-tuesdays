@@ -4,7 +4,7 @@ from numba import njit, uint64, int32
 from numba.typed import Dict
 from numba.core import types
 
-from board import (
+from src.board import (
     copy_board, get_side, piece_on, encode_move,
     get_pieces, get_white_occ, get_black_occ, get_all_occ,
     get_ep_square, get_castling, set_bit, clear_bit, get_bit,
@@ -13,7 +13,7 @@ from board import (
     B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
     CASTLE_WK, CASTLE_WQ, CASTLE_BK, CASTLE_BQ,
 )
-from evaluate import evaluate
+from src.evaluate import evaluate
 
 # =============================================================================
 # ATTACK HELPERS

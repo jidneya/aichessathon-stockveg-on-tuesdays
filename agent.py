@@ -37,6 +37,16 @@ print("Initializing NNUE evaluation...", flush=True)
 initialize_nnue("src/checkpoints/1_simple/quantised.bin")
 print("NNUE ready!", flush=True)
 
+# =============================================================================
+# NUMBA WARM-UP — forces JIT compilation of all search kernels NOW,
+# during the 90-second pre-game window, so move 1 is instant.
+# We run a shallow search on the starting position and discard the result.
+# =============================================================================
+print("Warming up Numba JIT (compiling search kernels)...", flush=True)
+_STARTPOS = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+_warmup_board = board_from_fen(_STARTPOS)
+get_best_move(_warmup_board, time_left_ms=5000)   # shallow, time-boxed warm-up
+print("Warm-up complete — ready to play!", flush=True)
 
 def get_move(fen: str, time_left_ms: int) -> str:
     """
