@@ -1,7 +1,7 @@
 import numpy as np
 from numba import njit, int16, int32
 
-from src.board import piece_on, get_side
+from board import piece_on, get_side
 
 # =============================================================================
 # NNUE ARCHITECTURE CONSTANTS
@@ -248,5 +248,5 @@ def test_evaluation():
     print(f"After 1.e4 eval: {score} centipawns")
 
 if __name__ == "__main__":
-    initialize_nnue("checkpoints/1_simple/quantised.bin")
+    initialize_nnue("checkpoints/quantised_2.bin")
     test_evaluation()
