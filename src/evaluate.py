@@ -1,5 +1,6 @@
 import numpy as np
 from numba import njit, int16, int32
+import csv
 
 from board import piece_on, get_side
 
@@ -234,18 +235,70 @@ def evaluate(board):
 # TESTING / DEBUGGING
 # =============================================================================
 def test_evaluation():
-    """Test the evaluation function on starting position."""
+    # """Test the evaluation function on starting position."""
     from board import board_from_fen
     
-    # Starting position
-    board = board_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-    score = evaluate(board)
-    print(f"Starting position eval: {score} centipawns")
+    # # Starting position
+    # board = board_from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    # score = evaluate(board)
+    # print(f"Starting position eval: {score} centipawns")
     
-    # Position after 1.e4
-    board = board_from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1")
-    score = evaluate(board)
-    print(f"After 1.e4 eval: {score} centipawns")
+    # # Position after 1.e4
+    # board = board_from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1")
+    # score = evaluate(board)
+    # print(f"After 1.e4 eval: {score} centipawns")
+    differences: list[int] = []
+    count_too_bad: int = 0
+    cnt_total: int = 0
+
+    with open("checkpoints/dataset_eval.csv", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header row (matches csv::Reader which skips headers by default)
+
+        for record in reader:
+            cnt_total += 1
+
+            fen         = record[1]
+            eval_field  = record[3]
+
+            # Skip mate scores (start with 'M'), mirroring the Rust continue
+            if eval_field.startswith("M"):
+                continue
+
+            actual_eval: int = int(eval_field)
+            nnue_eval:   int = evaluate(board_from_fen(fen))
+
+            difference = abs(nnue_eval - actual_eval)
+
+            # Mirror Rust's "too bad" condition exactly:
+            # (difference > 500 && actual_eval.abs() < 500 || nnue_eval * actual_eval < 0)
+            if (difference > 500 and abs(actual_eval) < 500) or (nnue_eval * actual_eval < 0):
+                count_too_bad += 1
+
+            differences.append(difference)
+
+            if (cnt_total % 1000 == 0):
+                print (cnt_total)
+            
+
+    # ---- Statistics --------------------------------------------------------
+
+    # Mean
+    mean = sum(differences) / len(differences)
+
+    # Median  (mirrors Rust's manual even/odd split)
+    differences.sort()
+    n = len(differences)
+    if n % 2 == 0:
+        mid = n // 2
+        median = (differences[mid - 1] + differences[mid]) / 2.0
+    else:
+        median = float(differences[n // 2])
+
+    print(f"Mean absolute difference:   {mean:.2f}")
+    print(f"Median absolute difference: {median:.2f}")
+    print(f"Number of bad / total : {count_too_bad} / {cnt_total}")
+    
 
 if __name__ == "__main__":
     initialize_nnue("checkpoints/quantised_2.bin")
