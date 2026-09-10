@@ -387,154 +387,207 @@ from numba import njit, uint64, int8, boolean
 #  Mirror square (^ 56) and flip colour for the opposite perspective.
 # ─────────────────────────────────────────────
 
-def build_accumulators(net: nnue.Network, pos: np.ndarray) -> tuple[nnue.Accumulator, nnue.Accumulator]:
-    """
-    Build both perspective accumulators from scratch for a given board state.
+# def build_accumulators(net: nnue.Network, pos: np.ndarray) -> tuple[nnue.Accumulator, nnue.Accumulator]:
+#     """
+#     Build both perspective accumulators from scratch for a given board state.
 
-    Args:
-        net : Network  — holds feature_weights and make_accumulator()
-        pos : np.ndarray (uint64, length 20) — the board state array
+#     Args:
+#         net : Network  — holds feature_weights and make_accumulator()
+#         pos : np.ndarray (uint64, length 20) — the board state array
 
-    Returns:
-        (us, them) — accumulators for side-to-move and the other side,
-                     returned as raw int16 np.ndarrays (not Accumulator objects)
-    """
-    us   = net.make_accumulator()
-    them = net.make_accumulator()
+#     Returns:
+#         (us, them) — accumulators for side-to-move and the other side,
+#                      returned as raw int16 np.ndarrays (not Accumulator objects)
+#     """
+#     us   = net.make_accumulator()
+#     them = net.make_accumulator()
 
-    stm = int(pos[17])   # 0 = white to move, 1 = black to move
+#     stm = int(pos[17])   # 0 = white to move, 1 = black to move
 
-    for p in range(12):
-        colour = 0 if p < 6 else 1
-        kind   = p % 6
+#     for p in range(12):
+#         colour = 0 if p < 6 else 1
+#         kind   = p % 6
 
-        bb = pos[p]      # bitboard for this piece type
-        while bb:
-            sq, bb = pop_lsb(bb)
+#         bb = pos[p]      # bitboard for this piece type
+#         while bb:
+#             sq, bb = pop_lsb(bb)
 
-            # Absolute (non-perspective) features
-            white_feat = colour * 384 + kind * 64 + sq
-            black_feat = (1 - colour) * 384 + kind * 64 + (sq ^ 56)
+#             # Absolute (non-perspective) features
+#             white_feat = colour * 384 + kind * 64 + sq
+#             black_feat = (1 - colour) * 384 + kind * 64 + (sq ^ 56)
 
-            # Assign to the correct perspective based on side to move
-            if stm == 0:   # white to move → us = white perspective
-                us_feat, them_feat = white_feat, black_feat
-            else:           # black to move → us = black perspective
-                us_feat, them_feat = black_feat, white_feat
+#             # Assign to the correct perspective based on side to move
+#             if stm == 0:   # white to move → us = white perspective
+#                 us_feat, them_feat = white_feat, black_feat
+#             else:           # black to move → us = black perspective
+#                 us_feat, them_feat = black_feat, white_feat
 
-            us.add_feature(us_feat, net)
-            them.add_feature(them_feat, net)
+#             us.add_feature(us_feat, net)
+#             them.add_feature(them_feat, net)
 
-    # Extract raw int16 arrays — callers work with these directly
-    return us.vals.copy(), them.vals.copy()
-
-
-# ─────────────────────────────────────────────
-#  NNUE — Feature index helper (njit)
-# ─────────────────────────────────────────────
-
-@njit(cache=True)
-def _make_features(piece_idx: int, sq: int, stm: int):
-    """
-    Compute (us_feat, them_feat) for a piece on a given square,
-    from the perspective of the node whose STM is `stm`.
-    All args are plain ints — fully njit compatible.
-    """
-    colour = 0 if piece_idx < 6 else 1
-    kind   = piece_idx % 6
-
-    white_feat = colour * 384 + kind * 64 + sq
-    black_feat = (1 - colour) * 384 + kind * 64 + (sq ^ 56)
-
-    if stm == 0:   # white to move → us = white perspective
-        return white_feat, black_feat
-    else:           # black to move → us = black perspective
-        return black_feat, white_feat
+#     # Extract raw int16 arrays — callers work with these directly
+#     return us.vals.copy(), them.vals.copy()
 
 
-# ─────────────────────────────────────────────
-#  NNUE — Incremental accumulator update (njit)
-#
-#  us, them      : raw int16 np.ndarrays, shape (HIDDEN_SIZE,)
-#  fw            : raw int16 np.ndarray,  shape (768, HIDDEN_SIZE)
-#                  extracted once from net.feature_weights before search
-#  pos           : board state BEFORE the move (uint64 array, length 20)
-#  move          : encoded move integer
-#
-#  Returns (child_us, child_them) with perspectives swapped,
-#  because after the move the STM flips.
-# ─────────────────────────────────────────────
+# # ─────────────────────────────────────────────
+# #  NNUE — Feature index helper (njit)
+# # ─────────────────────────────────────────────
 
-@njit(cache=True)
-def nnue_update_accumulators(us, them, fw, pos, move):
-    us_new   = us.copy()
-    them_new = them.copy()
+# @njit(cache=True)
+# def _make_features(piece_idx: int, sq: int, stm: int):
+#     """
+#     Compute (us_feat, them_feat) for a piece on a given square,
+#     from the perspective of the node whose STM is `stm`.
+#     All args are plain ints — fully njit compatible.
+#     """
+#     colour = 0 if piece_idx < 6 else 1
+#     kind   = piece_idx % 6
 
-    stm = int(pos[17])
-    from_sq = move & 63
-    to_sq   = (move >> 6) & 63
-    promo   = (move >> 12) & 15
+#     white_feat = colour * 384 + kind * 64 + sq
+#     black_feat = (1 - colour) * 384 + kind * 64 + (sq ^ 56)
 
-    moving_piece   = piece_on(pos, from_sq)   # 0-11
-    captured_piece = piece_on(pos, to_sq)     # -1 if empty
-
-    # ── 1. Remove the moving piece from its origin ────────────────────────
-    us_feat, them_feat = _make_features(moving_piece, from_sq, stm)
-    us_new   -= fw[us_feat]
-    them_new -= fw[them_feat]
-
-    # ── 2. Remove any captured piece from the destination ─────────────────
-    if captured_piece != -1:
-        us_feat, them_feat = _make_features(captured_piece, to_sq, stm)
-        us_new   -= fw[us_feat]
-        them_new -= fw[them_feat]
-
-    # ── 3. En passant — remove the captured pawn from its real square ──────
-    ep_sq = int(pos[15])   # 64 = no en passant
-    is_ep = (
-        (moving_piece == W_PAWN or moving_piece == B_PAWN)
-        and to_sq == ep_sq
-        and ep_sq != 64
-    )
-    if is_ep:
-        ep_capture_sq = to_sq - 8 if stm == 0 else to_sq + 8
-        ep_pawn       = B_PAWN if stm == 0 else W_PAWN
-        us_feat, them_feat = _make_features(ep_pawn, ep_capture_sq, stm)
-        us_new   -= fw[us_feat]
-        them_new -= fw[them_feat]
-
-    # ── 4. Add the piece that lands on to_sq ──────────────────────────────
-    landing_piece = promo if promo != 0 else moving_piece
-    us_feat, them_feat = _make_features(landing_piece, to_sq, stm)
-    us_new   += fw[us_feat]
-    them_new += fw[them_feat]
-
-    # ── 5. Swap perspectives — child's STM is the opponent ────────────────
-    return them_new, us_new
+#     if stm == 0:   # white to move → us = white perspective
+#         return white_feat, black_feat
+#     else:           # black to move → us = black perspective
+#         return black_feat, white_feat
 
 
-# ─────────────────────────────────────────────
-#  NNUE — Evaluation
-#  us, them are raw int16 arrays.
-#  net is still the full Network object — needed for output_weights/bias.
-# ─────────────────────────────────────────────
+# # ─────────────────────────────────────────────
+# #  NNUE — Incremental accumulator update (njit)
+# #
+# #  us, them      : raw int16 np.ndarrays, shape (HIDDEN_SIZE,)
+# #  fw            : raw int16 np.ndarray,  shape (768, HIDDEN_SIZE)
+# #                  extracted once from net.feature_weights before search
+# #  pos           : board state BEFORE the move (uint64 array, length 20)
+# #  move          : encoded move integer
+# #
+# #  Returns (child_us, child_them) with perspectives swapped,
+# #  because after the move the STM flips.
+# # ─────────────────────────────────────────────
 
-def nnue_evaluate(us, them, net) -> int:
-    # Wrap back into Accumulator objects only for the evaluate call
-    us_acc   = nnue.Accumulator(us)
-    them_acc = nnue.Accumulator(them)
-    return net.evaluate(us_acc, them_acc)
+# @njit(cache=True)
+# def nnue_update_accumulators(us, them, fw, pos, move):
+#     us_new   = us.copy()
+#     them_new = them.copy()
+
+#     stm = int(pos[17])
+#     from_sq = move & 63
+#     to_sq   = (move >> 6) & 63
+#     promo   = (move >> 12) & 15
+
+#     moving_piece   = piece_on(pos, from_sq)   # 0-11
+#     captured_piece = piece_on(pos, to_sq)     # -1 if empty
+
+#     # ── 1. Remove the moving piece from its origin ────────────────────────
+#     us_feat, them_feat = _make_features(moving_piece, from_sq, stm)
+#     us_new   -= fw[us_feat]
+#     them_new -= fw[them_feat]
+
+#     # ── 2. Remove any captured piece from the destination ─────────────────
+#     if captured_piece != -1:
+#         us_feat, them_feat = _make_features(captured_piece, to_sq, stm)
+#         us_new   -= fw[us_feat]
+#         them_new -= fw[them_feat]
+
+#     # ── 3. En passant — remove the captured pawn from its real square ──────
+#     ep_sq = int(pos[15])   # 64 = no en passant
+#     is_ep = (
+#         (moving_piece == W_PAWN or moving_piece == B_PAWN)
+#         and to_sq == ep_sq
+#         and ep_sq != 64
+#     )
+#     if is_ep:
+#         ep_capture_sq = to_sq - 8 if stm == 0 else to_sq + 8
+#         ep_pawn       = B_PAWN if stm == 0 else W_PAWN
+#         us_feat, them_feat = _make_features(ep_pawn, ep_capture_sq, stm)
+#         us_new   -= fw[us_feat]
+#         them_new -= fw[them_feat]
+
+#     # ── 4. Add the piece that lands on to_sq ──────────────────────────────
+#     landing_piece = promo if promo != 0 else moving_piece
+#     us_feat, them_feat = _make_features(landing_piece, to_sq, stm)
+#     us_new   += fw[us_feat]
+#     them_new += fw[them_feat]
+
+#     # ── 5. Swap perspectives — child's STM is the opponent ────────────────
+#     return them_new, us_new
+
+
+# # ─────────────────────────────────────────────
+# #  NNUE — Evaluation
+# #  us, them are raw int16 arrays.
+# #  net is still the full Network object — needed for output_weights/bias.
+# # ─────────────────────────────────────────────
+
+# def nnue_evaluate(us, them, net) -> int:
+#     # Wrap back into Accumulator objects only for the evaluate call
+#     us_acc   = nnue.Accumulator(us)
+#     them_acc = nnue.Accumulator(them)
+#     return net.evaluate(us_acc, them_acc)
+
+
+# # ─────────────────────────────────────────────
+# #  Search
+# # ─────────────────────────────────────────────
+
+# def minimax(net, fw, board, us, them, depth, maximising):
+#     moves = generate_legal_moves(board)
+
+#     if depth == 0 or not moves:
+#         return nnue_evaluate(us, them, net), None
+
+#     best_move  = None
+#     best_score = -INFINITY if maximising else INFINITY
+
+#     for move in moves:
+#         child_board = copy_board(board)
+#         make_move(child_board, move)
+#         child_us, child_them = nnue_update_accumulators(us, them, fw, board, move)
+
+#         score, _ = minimax(net, fw, child_board, child_us, child_them, depth - 1, not maximising)
+
+#         if maximising and score > best_score:
+#             best_score, best_move = score, move
+#         elif not maximising and score < best_score:
+#             best_score, best_move = score, move
+
+#     return best_score, best_move
+
+
+# def search(net, board, depth):
+#     # Extract raw feature weight matrix once — passed as a plain ndarray into njit
+#     fw = np.stack([acc.vals for acc in net.feature_weights], axis=0)  # (768, HIDDEN_SIZE) int16
+
+#     us, them         = build_accumulators(net, board)   # raw int16 arrays
+#     score, best_move = minimax(net, fw, board, us, them, depth, maximising=(int(board[17]) == 0))
+#     print(f"Best move: {move_to_uci(best_move)} | Score: {score}")
+#     return best_move
+
+
+# if __name__ == "__main__":
+#     net = nnue.load_network("../nnue_test/nnue_test/checkpoints/quantised_2.bin")
+#     bd  = board_from_fen("r3r1k1/p2q1pp1/2p4p/8/1P1PRB2/P4Q1P/1P3PP1/4R1K1 b - - 4 20")
+#     search(net, bd, 2)
+
+# import numpy as np
+# import nnue
+# from board import pop_lsb, piece_on, W_PAWN, B_PAWN, generate_legal_moves, copy_board, make_move, board_from_fen, move_to_uci
+
+INFINITY = 10_000_000
 
 
 # ─────────────────────────────────────────────
 #  Search
 # ─────────────────────────────────────────────
 
-def minimax(net, fw, board, us, them, depth, maximising):
+def minimax(feature_weights, output_weights, output_bias, board, us, them, depth, alpha, beta, maximising):
     moves = generate_legal_moves(board)
 
     if depth == 0 or not moves:
-        return nnue_evaluate(us, them, net), None
+        # nnue.evaluate takes raw int16 arrays + raw output weights/bias.
+        # No wrapper objects, no re-boxing — fully compatible with the @njit path.
+        score = nnue.evaluate(us, them, output_weights, output_bias)
+        return score, None
 
     best_move  = None
     best_score = -INFINITY if maximising else INFINITY
@@ -542,29 +595,61 @@ def minimax(net, fw, board, us, them, depth, maximising):
     for move in moves:
         child_board = copy_board(board)
         make_move(child_board, move)
-        child_us, child_them = nnue_update_accumulators(us, them, fw, board, move)
 
-        score, _ = minimax(net, fw, child_board, child_us, child_them, depth - 1, not maximising)
+        # nnue.update_accumulators takes raw int16 accumulators + raw feature
+        # weight matrix. Returns (child_us, child_them) already perspective-swapped.
+        child_us, child_them = nnue.update_accumulators(
+            us, them, feature_weights, board, move
+        )
 
-        if maximising and score > best_score:
-            best_score, best_move = score, move
-        elif not maximising and score < best_score:
-            best_score, best_move = score, move
+        score, _ = minimax(
+            feature_weights, output_weights, output_bias,
+            child_board, child_us, child_them,
+            depth - 1, alpha, beta, not maximising
+        )
+
+        if maximising:
+            if score > best_score:
+                best_score, best_move = score, move
+            alpha = max(alpha, best_score)
+        else:
+            if score < best_score:
+                best_score, best_move = score, move
+            beta = min(beta, best_score)
+
+        # Beta cutoff (maximiser) / Alpha cutoff (minimiser)
+        if beta <= alpha:
+            break
 
     return best_score, best_move
 
 
 def search(net, board, depth):
-    # Extract raw feature weight matrix once — passed as a plain ndarray into njit
-    fw = np.stack([acc.vals for acc in net.feature_weights], axis=0)  # (768, HIDDEN_SIZE) int16
+    # net is a plain tuple — unpack it once here, then pass only what each
+    # call site needs. No attribute access, no Python object overhead.
+    feature_weights, feature_bias, output_weights, output_bias = net
 
-    us, them         = build_accumulators(net, board)   # raw int16 arrays
-    score, best_move = minimax(net, fw, board, us, them, depth, maximising=(int(board[17]) == 0))
+    # Build the root accumulators from scratch using the @njit function.
+    # feature_bias initialises both accumulators; feature_weights fills them.
+    us, them = nnue.build_accumulators(feature_weights, feature_bias, board)
+
+    score, best_move = minimax(
+        feature_weights, output_weights, output_bias,
+        board, us, them,
+        depth,
+        alpha=-INFINITY,
+        beta=INFINITY,
+        maximising=(int(board[17]) == 0)   # 0 = white to move
+    )
+
     print(f"Best move: {move_to_uci(best_move)} | Score: {score}")
     return best_move
 
 
 if __name__ == "__main__":
-    net = nnue.Network.load("../nnue_test/nnue_test/checkpoints/quantised_2.bin")
-    bd  = board_from_fen("r3r1k1/p2q1pp1/2p4p/8/1P1PRB2/P4Q1P/1P3PP1/4R1K1 b - - 4 20")
-    search(net, bd, 2)
+    # load_network returns a plain tuple — no class instantiation.
+    net = nnue.load_network("../nnue_test/nnue_test/checkpoints/quantised_2.bin")
+    # bd  = board_from_fen("r3r1k1/p2q1pp1/2p4p/8/1P1PRB2/P4Q1P/1P3PP1/4R1K1 b - - 4 20")
+    # search(net, bd, 6)
+
+    
