@@ -30,7 +30,7 @@ L1_BIASES = np.int16(0)
 # =============================================================================
 # LOAD CHECKPOINT
 # =============================================================================
-def initialize_nnue(checkpoint_path="checkpoints/1_simple/quantised.bin"):
+def initialize_nnue(checkpoint_path="checkpoints/quantised_2.bin"):
     """
     Load quantized NNUE weights from bullet checkpoint.
     

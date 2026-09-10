@@ -34,7 +34,7 @@ from src.evaluate import initialize_nnue
 # NNUE INITIALISATION  (runs once per process)
 # =============================================================================
 print("Initializing NNUE evaluation...", flush=True)
-initialize_nnue("src/checkpoints/1_simple/quantised.bin")
+initialize_nnue("src/checkpoints/quantised_2.bin")
 print("NNUE ready!", flush=True)
 
 # =============================================================================
