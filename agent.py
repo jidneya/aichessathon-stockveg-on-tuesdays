@@ -4,7 +4,7 @@ import chess
 import chess.polyglot
 import chess.syzygy
 from src.board import board_from_fen, decode_move, copy_board
-from src.search import get_best_move, negamax, create_tt, compute_hash, make_move
+from src.search import get_best_move, negamax, create_tt, compute_hash, make_move, clear_tt
 
 # =============================================================================
 # CLEAR NUMBA __pycache__ BEFORE ANY NUMBA IMPORTS
@@ -216,10 +216,11 @@ def get_move(fen: str, time_left_ms: int) -> str:
     halfmove = int(parts[4]) if len(parts) > 4 else 0
     fullmove = int(parts[5]) if len(parts) > 5 else 1
 
+    # Detect new game to reset history and memory
     if fullmove < _last_fullmove or (fullmove == 1 and halfmove == 0):
-        print("New game detected — history reset.", flush=True)
+        print("New game detected — history and TT reset.", flush=True)
         _game_history = []
-    _last_fullmove = fullmove
+        clear_tt()
 
     # Build a python-chess Board from the FEN — used by polyglot & syzygy only.
     # Your Numba search uses board_from_fen() separately below.

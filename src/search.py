@@ -722,6 +722,14 @@ def create_tt():
         value_type=types.UniTuple(types.int32, 4),
     )
 
+# Instantiate the global table
+GLOBAL_TT = create_tt()
+
+def clear_tt():
+    """Wipes the TT to free memory between games."""
+    global GLOBAL_TT
+    GLOBAL_TT = create_tt()
+
 @njit(cache=True)
 def tt_store(tt, h, depth, score, flag, best_move):
     tt[h] = (int32(depth), int32(score), int32(flag), int32(best_move))
@@ -833,7 +841,7 @@ def get_best_move(board_array, time_left_ms, game_hist):
     A brand-new TT is created for every call so stale entries from
     previous games can never corrupt the search.
     """
-    tt = create_tt()
+    tt = GLOBAL_TT
 
     start   = time.time()
     budget  = max(0.5, min(8.0, (time_left_ms / 1000.0) / 40.0))
