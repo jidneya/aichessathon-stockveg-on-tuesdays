@@ -746,8 +746,23 @@ def tt_probe(tt, h, depth, alpha, beta):
 # =============================================================================
 
 @njit(cache=True)
-def negamax(board, depth, alpha, beta, color, tt, allow_null):
+def count_hash_in_history(h, hist, hist_len):
+    """Count occurrences of uint64 hash h in hist[0:hist_len]."""
+    count = int32(0)
+    for i in range(hist_len):
+        if hist[i] == h:
+            count += int32(1)
+    return count
+
+@njit(cache=True)
+def negamax(board, depth, alpha, beta, color, tt, allow_null, ply, hist, hist_len):
     h = compute_hash(board)
+
+    # Repetition check (punish draws when winning)
+    if ply > 0:
+        if count_hash_in_history(h, hist, hist_len + ply) >= 1:
+            return int32(-10)
+    
     hit, tt_score, tt_move = tt_probe(tt, h, depth, alpha, beta)
     if hit:
         return tt_score
@@ -759,11 +774,14 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null):
         # until the position is stable, then call evaluate().
         return quiescence(board, alpha, beta)
 
+    # Record current hash into scratchpad for child node checking
+    hist[hist_len + ply] = h
+
     # Null-move pruning
     if allow_null and depth >= 3:
         null_board = copy_board(board)
         make_null_move(null_board)
-        null_score = -negamax(null_board, depth - 3, -beta, -beta + 1, -color, tt, False)
+        null_score = -negamax(null_board, depth - 3, -beta, -beta + 1, -color, tt, False, ply + 1, hist, hist_len)
         if null_score >= beta:
             return beta
 
@@ -785,11 +803,11 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null):
         make_move(nb, move)
 
         if i == 0:
-            score = -negamax(nb, depth - 1, -beta, -alpha, -color, tt, True)
+            score = -negamax(nb, depth - 1, -beta, -alpha, -color, tt, True, ply + 1, hist, hist_len)
         else:
-            score = -negamax(nb, depth - 1, -alpha - 1, -alpha, -color, tt, True)
+            score = -negamax(nb, depth - 1, -alpha - 1, -alpha, -color, tt, True, ply + 1, hist, hist_len)
             if alpha < score < beta:
-                score = -negamax(nb, depth - 1, -beta, -alpha, -color, tt, True)
+                score = -negamax(nb, depth - 1, -beta, -alpha, -color, tt, True, ply + 1, hist, hist_len)
 
         if score > best_score:
             best_score = score
@@ -808,7 +826,7 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null):
 # ITERATIVE DEEPENING + TIME MANAGEMENT
 # =============================================================================
 
-def get_best_move(board_array, time_left_ms):
+def get_best_move(board_array, time_left_ms, game_hist):
     """
     Iterative-deepening search with per-move time budget.
 
@@ -819,6 +837,11 @@ def get_best_move(board_array, time_left_ms):
 
     start   = time.time()
     budget  = max(0.5, min(8.0, (time_left_ms / 1000.0) / 40.0))
+
+    hist = np.zeros(512, dtype=np.uint64)
+    hist_len = np.int32(min(len(game_hist), 256))
+    for i in range(hist_len):
+        hist[i] = np.uint64(game_hist[i])
 
     def elapsed():
         return time.time() - start
@@ -833,7 +856,7 @@ def get_best_move(board_array, time_left_ms):
         if not time_ok(0.5) and depth > 1:
             break
 
-        score = negamax(board_array, depth, -INFINITY, INFINITY, 1, tt, True)
+        score = negamax(board_array, depth, -INFINITY, INFINITY, 1, tt, True, np.int32(0), hist, hist_len)
 
         h = compute_hash(board_array)
         current_best = 0

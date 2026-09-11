@@ -3,6 +3,8 @@ import shutil
 import chess
 import chess.polyglot
 import chess.syzygy
+from src.board import board_from_fen, decode_move, copy_board
+from src.search import get_best_move, negamax, create_tt, compute_hash, make_move
 
 # =============================================================================
 # CLEAR NUMBA __pycache__ BEFORE ANY NUMBA IMPORTS
@@ -78,9 +80,15 @@ else:
 print("Warming up Numba JIT (compiling search kernels)...", flush=True)
 _STARTPOS    = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 _warmup_board = board_from_fen(_STARTPOS)
-get_best_move(_warmup_board, time_left_ms=5000)
+get_best_move(_warmup_board, time_left_ms=5000, game_hist=[])
 print("Warm-up complete — ready to play!", flush=True)
 
+
+# =============================================================================
+# GAME HISTORY
+# =============================================================================
+_game_history = []
+_last_fullmove = 0
 
 # =============================================================================
 # HELPERS
@@ -190,6 +198,7 @@ def _encoded_to_uci(best_encoded_move: int) -> str:
 # =============================================================================
 
 def get_move(fen: str, time_left_ms: int) -> str:
+    global _game_history, _last_fullmove
     """
     Called by the harness for every move.
     Returns a UCI move string e.g. 'e2e4', 'e7e8q'.
@@ -202,15 +211,28 @@ def get_move(fen: str, time_left_ms: int) -> str:
     print(f"Searching position: {fen[:50]}...", flush=True)
     print(f"Time remaining: {time_left_ms}ms", flush=True)
 
+    # Parse FEN fields to track game progress
+    parts = fen.split()
+    halfmove = int(parts[4]) if len(parts) > 4 else 0
+    fullmove = int(parts[5]) if len(parts) > 5 else 1
+
+    if fullmove < _last_fullmove or (fullmove == 1 and halfmove == 0):
+        print("New game detected — history reset.", flush=True)
+        _game_history = []
+    _last_fullmove = fullmove
+
     # Build a python-chess Board from the FEN — used by polyglot & syzygy only.
     # Your Numba search uses board_from_fen() separately below.
     board = chess.Board(fen)
+    board_array = board_from_fen(fen)
+    current_hash = np.uint64(compute_hash(board_array))
 
     # ------------------------------------------------------------------
     # 1. Opening book
     # ------------------------------------------------------------------
     book_move = _try_book_move(board)
     if book_move:
+        _game_history.append(current_hash)
         return book_move
 
     # ------------------------------------------------------------------
@@ -218,14 +240,24 @@ def get_move(fen: str, time_left_ms: int) -> str:
     # ------------------------------------------------------------------
     tb_move = _try_tablebase_move(board)
     if tb_move:
+        _game_history.append(current_hash)
         return tb_move
 
     # ------------------------------------------------------------------
     # 3. NNUE + negamax search (main engine)
     # ------------------------------------------------------------------
-    board_array       = board_from_fen(fen)
-    best_encoded_move = get_best_move(board_array, time_left_ms)
-    uci               = _encoded_to_uci(best_encoded_move)
+    _game_history.append(current_hash)
+    best_encoded_move = get_best_move(board_array, time_left_ms, _game_history)
 
+    # Apply the engine's move to record the opponent's resulting position 
+    child = copy_board(board_array)
+    make_move(child, best_encoded_move)
+    _game_history.append(np.uint64(compute_hash(child)))
+
+    # Trim history to prevent memory leak in excessively long games
+    if len(_game_history) > 200:
+        _game_history = _game_history[-200:]
+    
+    uci = _encoded_to_uci(best_encoded_move)
     print(f"Best move: {uci}", flush=True)
     return uci
