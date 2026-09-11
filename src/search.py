@@ -763,6 +763,48 @@ def count_hash_in_history(h, hist, hist_len):
     return count
 
 @njit(cache=True)
+def sort_moves(board, moves, tt_move):
+    """Scores and sorts moves in-place: TT move > Queen Promos > MVV-LVA Captures > Quiets."""
+    scores = np.zeros(len(moves), dtype=np.int32)
+    
+    for i in range(len(moves)):
+        mv = moves[i]
+        
+        # 1. Highest Priority: Transposition Table Move
+        if mv == tt_move:
+            scores[i] = 9000000
+            continue
+        
+        # 2. Second Priority: Queen Promotions (W_QUEEN = 4, B_QUEEN = 10)
+        promo = (mv >> 12) & 15
+        if promo == 4 or promo == 10:
+            scores[i] = 8000000
+            continue
+            
+        # 3. Third Priority: Captures ordered by MVV-LVA
+        to_sq = (mv >> 6) & 63
+        from_sq = mv & 63
+        victim = piece_on(board, to_sq)
+        
+        if victim != -1:
+            attacker = piece_on(board, from_sq)
+            scores[i] = 1000000 + _PIECE_VALUES[victim] * 10 - _PIECE_VALUES[attacker]
+        else:
+            scores[i] = 0
+
+    # Insertion sort (descending)
+    for i in range(1, len(moves)):
+        key_mv = moves[i]
+        key_sc = scores[i]
+        j = i - 1
+        while j >= 0 and scores[j] < key_sc:
+            moves[j + 1] = moves[j]
+            scores[j + 1] = scores[j]
+            j -= 1
+        moves[j + 1] = key_mv
+        scores[j + 1] = key_sc
+
+@njit(cache=True)
 def negamax(board, depth, alpha, beta, color, tt, allow_null, ply, hist, hist_len):
     h = compute_hash(board)
 
@@ -800,6 +842,9 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null, ply, hist, hist_le
         if ksq < 64 and is_square_attacked(board, ksq, 1 - get_side(board)):
             return -INFINITY + depth
         return 0
+
+    # --- NEW: Sort moves to maximize Alpha-Beta pruning ---
+    sort_moves(board, moves, tt_move)
 
     best_score  = -INFINITY
     best_move   = int32(0)
