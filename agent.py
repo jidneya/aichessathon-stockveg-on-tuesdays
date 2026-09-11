@@ -41,7 +41,7 @@ from src.evaluate import initialize_nnue
 _BASE        = os.path.dirname(os.path.abspath(__file__))
 _BOOK_PATH   = os.path.join(_BASE, "src", "books",  "opening.bin")   # polyglot book
 _SYZYGY_PATH = os.path.join(_BASE, "src", "syzygy")                  # folder of .rtbw/.rtbz files
-_NNUE_PATH   = os.path.join(_BASE, "src", "checkpoints", "quantised_2.bin")
+_NNUE_PATH   = os.path.join(_BASE, "src", "checkpoints", "final_final_weights.bin")
 
 # =============================================================================
 # NNUE INITIALISATION  (runs once per process)

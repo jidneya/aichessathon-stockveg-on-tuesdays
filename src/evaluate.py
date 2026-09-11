@@ -30,7 +30,7 @@ L1_BIASES = np.int16(0)
 # =============================================================================
 # LOAD CHECKPOINT
 # =============================================================================
-def initialize_nnue(checkpoint_path="checkpoints/final_weights.bin"):
+def initialize_nnue(checkpoint_path="checkpoints/final_final_weights.bin"):
     """
     Load quantized NNUE weights from bullet checkpoint.
     
@@ -301,5 +301,5 @@ def test_evaluation():
     
 
 if __name__ == "__main__":
-    initialize_nnue("checkpoints/final_weights.bin")
+    initialize_nnue("checkpoints/final_final_weights.bin")
     test_evaluation()
