@@ -696,16 +696,32 @@ def quiescence(board, alpha, beta):
 np.random.seed(42)
 ZOBRIST_PIECES = np.random.randint(0, 2**63, size=(12, 64), dtype=np.int64).view(np.uint64)
 ZOBRIST_SIDE   = np.random.randint(0, 2**63, dtype=np.int64).view(np.uint64)[()]
+# 16 possible castling states (4-bit mask)
+ZOBRIST_CASTLE = np.random.randint(0, 2**63, size=16, dtype=np.int64).view(np.uint64)
+# 65 possible EP squares (0-63, plus 64 for "none")
+ZOBRIST_EP     = np.random.randint(0, 2**63, size=65, dtype=np.int64).view(np.uint64)
 
 @njit(cache=True)
 def compute_hash(board):
     h = uint64(0)
-    for sq in range(64):
-        p = piece_on(board, sq)
-        if p != -1:
+
+    # 1. Fast Bitboard Iteration (Skips empty squares entirely)
+    for p in range(12):
+        bb = board[p]
+        while bb:
+            sq, bb = pop_lsb(bb)
             h ^= ZOBRIST_PIECES[p, sq]
+            
+    # 2. Side to move
     if get_side(board) == 1:
         h ^= ZOBRIST_SIDE
+        
+    # 3. Castling Rights (0-15)
+    h ^= ZOBRIST_CASTLE[get_castling(board)]
+    
+    # 4. En Passant Square (0-64)
+    h ^= ZOBRIST_EP[get_ep_square(board)]
+    
     return h
 
 # =============================================================================
@@ -808,6 +824,11 @@ def sort_moves(board, moves, tt_move):
 def negamax(board, depth, alpha, beta, color, tt, allow_null, ply, hist, hist_len):
     h = compute_hash(board)
 
+    # Hard cap the index to prevent out-of-bounds crashes
+    limit = hist_len + ply
+    if limit > 1023:
+        limit = int32(1023)
+
     # Repetition check (punish draws when winning)
     if ply > 0:
         if count_hash_in_history(h, hist, hist_len + ply) >= 1:
@@ -824,8 +845,9 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null, ply, hist, hist_le
         # until the position is stable, then call evaluate().
         return quiescence(board, alpha, beta)
 
-    # Record current hash into scratchpad for child node checking
-    hist[hist_len + ply] = h
+    # Safely write the current hash to the history scratchpad
+    if hist_len + ply < 1024:
+        hist[hist_len + ply] = h
 
     # Null-move pruning
     if allow_null and depth >= 3:
@@ -879,6 +901,14 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null, ply, hist, hist_le
 # ITERATIVE DEEPENING + TIME MANAGEMENT
 # =============================================================================
 
+@njit(cache=True)
+def extract_tt_move(tt, h):
+    """Safely extracts the best move from the TT inside JIT memory."""
+    if uint64(h) in tt:
+        # tt[h] is (depth, score, flag, move)
+        return tt[h][3]
+    return int32(0)
+
 def get_best_move(board_array, time_left_ms, game_hist):
     """
     Iterative-deepening search with per-move time budget.
@@ -891,11 +921,12 @@ def get_best_move(board_array, time_left_ms, game_hist):
     start   = time.time()
     budget  = max(0.5, min(8.0, (time_left_ms / 1000.0) / 40.0))
 
-    hist = np.zeros(512, dtype=np.uint64)
-    hist_len = np.int32(min(len(game_hist), 256))
+    # FIX 1: Double the array size to 1024 to prevent IndexError
+    hist = np.zeros(1024, dtype=np.uint64)
+    hist_len = np.int32(min(len(game_hist), 512))
     for i in range(hist_len):
         hist[i] = np.uint64(game_hist[i])
-
+    
     def elapsed():
         return time.time() - start
 
@@ -912,9 +943,9 @@ def get_best_move(board_array, time_left_ms, game_hist):
         score = negamax(board_array, depth, -INFINITY, INFINITY, 1, tt, True, np.int32(0), hist, hist_len)
 
         h = compute_hash(board_array)
-        current_best = 0
-        if h in tt:
-            _, _, _, current_best = tt[h]
+        
+        # FIX 2: Safely extract the TT move using JIT instead of pure python
+        current_best = extract_tt_move(tt, h)
 
         last_best  = current_best if current_best != 0 else last_best
         last_score = score
