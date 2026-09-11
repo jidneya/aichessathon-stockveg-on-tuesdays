@@ -186,7 +186,7 @@ def _encoded_to_uci(best_encoded_move: int) -> str:
     uci = sq_to_uci(from_sq) + sq_to_uci(to_sq)
 
     promo_map = {0: '', 1: 'n', 2: 'b', 3: 'r', 4: 'q',
-                 9: 'n', 10: 'b', 11: 'r', 12: 'q'}
+             7: 'n', 8: 'b', 9: 'r', 10: 'q'}
     if promo in promo_map and promo_map[promo]:
         uci += promo_map[promo]
 
