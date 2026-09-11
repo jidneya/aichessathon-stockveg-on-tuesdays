@@ -392,336 +392,22 @@ def generate_legal_moves(board):
 
     return legal[:legal_count]
 
-
-# =============================================================================
-# CAPTURE-ONLY MOVE GENERATION  (used by quiescence search)
-# =============================================================================
-# *** NEW FUNCTION ***
-# Generates only captures (and queen promotions) — no quiet moves.
-# This keeps quiescence search fast by only looking at forcing moves.
-#
-# Piece values used for MVV-LVA ordering (victim value - attacker value):
-#   Pawn=100, Knight=320, Bishop=330, Rook=500, Queen=900, King=20000
-# Higher score = search first (most likely to cause a cutoff).
-# =============================================================================
-
-# Piece values indexed by piece index (W_PAWN=0 .. B_KING=11)
-_PIECE_VALUES = np.array(
-    [100, 320, 330, 500, 900, 20000,   # white pieces
-     100, 320, 330, 500, 900, 20000],  # black pieces
-    dtype=np.int32
-)
-
-@njit(cache=True)
-def generate_capture_moves(board):
-    """
-    Returns an array of capture moves sorted by MVV-LVA
-    (Most Valuable Victim - Least Valuable Attacker).
-    Only captures and queen-promotions are included.
-    """
-    side    = get_side(board)
-    occ     = get_all_occ(board)
-    my_occ  = get_white_occ(board) if side == 0 else get_black_occ(board)
-    opp_occ = get_black_occ(board) if side == 0 else get_white_occ(board)
-    ep_sq   = get_ep_square(board)
-
-    pseudo  = np.zeros(64, dtype=np.int32)
-    scores  = np.zeros(64, dtype=np.int32)
-    count   = 0
-
-    if side == 0:  # ---- WHITE captures ----
-        # Pawn captures (including en passant and promotion captures)
-        pawns = get_pieces(board, W_PAWN)
-        while pawns:
-            sq, pawns = pop_lsb(pawns)
-            r, f = sq // 8, sq % 8
-            for df in (-1, 1):
-                nf = f + df
-                if 0 <= nf <= 7:
-                    tsq = (r + 1) * 8 + nf
-                    if get_bit(opp_occ, tsq):
-                        victim = piece_on(board, tsq)
-                        if r == 6:  # promotion capture — only queen promo
-                            pseudo[count] = (W_QUEEN << 12) | (tsq << 6) | sq
-                            scores[count] = 900 + (_PIECE_VALUES[victim] if victim != -1 else 0)
-                            count += 1
-                        else:
-                            pseudo[count] = (tsq << 6) | sq
-                            scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 100
-                            count += 1
-                    elif tsq == ep_sq and ep_sq != 64:
-                        pseudo[count] = (tsq << 6) | sq
-                        scores[count] = 0  # pawn x pawn
-                        count += 1
-
-        # Knight captures
-        knights = get_pieces(board, W_KNIGHT)
-        while knights:
-            sq, knights = pop_lsb(knights)
-            targets = knight_attacks_sq(sq) & opp_occ
-            while targets:
-                tsq, targets = pop_lsb(targets)
-                victim = piece_on(board, tsq)
-                pseudo[count] = (tsq << 6) | sq
-                scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 320
-                count += 1
-
-        # Bishop captures
-        bishops = get_pieces(board, W_BISHOP)
-        while bishops:
-            sq, bishops = pop_lsb(bishops)
-            targets = bishop_attacks_sq(sq, occ) & opp_occ
-            while targets:
-                tsq, targets = pop_lsb(targets)
-                victim = piece_on(board, tsq)
-                pseudo[count] = (tsq << 6) | sq
-                scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 330
-                count += 1
-
-        # Rook captures
-        rooks = get_pieces(board, W_ROOK)
-        while rooks:
-            sq, rooks = pop_lsb(rooks)
-            targets = rook_attacks_sq(sq, occ) & opp_occ
-            while targets:
-                tsq, targets = pop_lsb(targets)
-                victim = piece_on(board, tsq)
-                pseudo[count] = (tsq << 6) | sq
-                scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 500
-                count += 1
-
-        # Queen captures
-        queens = get_pieces(board, W_QUEEN)
-        while queens:
-            sq, queens = pop_lsb(queens)
-            targets = queen_attacks_sq(sq, occ) & opp_occ
-            while targets:
-                tsq, targets = pop_lsb(targets)
-                victim = piece_on(board, tsq)
-                pseudo[count] = (tsq << 6) | sq
-                scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 900
-                count += 1
-
-        # King captures
-        ksq = lsb(get_pieces(board, W_KING))
-        if ksq < 64:
-            targets = king_attacks_sq(ksq) & opp_occ
-            while targets:
-                tsq, targets = pop_lsb(targets)
-                victim = piece_on(board, tsq)
-                pseudo[count] = (tsq << 6) | ksq
-                scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 20000
-                count += 1
-
-    else:  # ---- BLACK captures ----
-        # Pawn captures
-        pawns = get_pieces(board, B_PAWN)
-        while pawns:
-            sq, pawns = pop_lsb(pawns)
-            r, f = sq // 8, sq % 8
-            for df in (-1, 1):
-                nf = f + df
-                if 0 <= nf <= 7:
-                    tsq = (r - 1) * 8 + nf
-                    if tsq >= 0 and get_bit(opp_occ, tsq):
-                        victim = piece_on(board, tsq)
-                        if r == 1:  # promotion capture — only queen promo
-                            pseudo[count] = (B_QUEEN << 12) | (tsq << 6) | sq
-                            scores[count] = 900 + (_PIECE_VALUES[victim] if victim != -1 else 0)
-                            count += 1
-                        else:
-                            pseudo[count] = (tsq << 6) | sq
-                            scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 100
-                            count += 1
-                    elif tsq == ep_sq and ep_sq != 64:
-                        pseudo[count] = (tsq << 6) | sq
-                        scores[count] = 0
-                        count += 1
-
-        # Knight captures
-        knights = get_pieces(board, B_KNIGHT)
-        while knights:
-            sq, knights = pop_lsb(knights)
-            targets = knight_attacks_sq(sq) & opp_occ
-            while targets:
-                tsq, targets = pop_lsb(targets)
-                victim = piece_on(board, tsq)
-                pseudo[count] = (tsq << 6) | sq
-                scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 320
-                count += 1
-
-        # Bishop captures
-        bishops = get_pieces(board, B_BISHOP)
-        while bishops:
-            sq, bishops = pop_lsb(bishops)
-            targets = bishop_attacks_sq(sq, occ) & opp_occ
-            while targets:
-                tsq, targets = pop_lsb(targets)
-                victim = piece_on(board, tsq)
-                pseudo[count] = (tsq << 6) | sq
-                scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 330
-                count += 1
-
-        # Rook captures
-        rooks = get_pieces(board, B_ROOK)
-        while rooks:
-            sq, rooks = pop_lsb(rooks)
-            targets = rook_attacks_sq(sq, occ) & opp_occ
-            while targets:
-                tsq, targets = pop_lsb(targets)
-                victim = piece_on(board, tsq)
-                pseudo[count] = (tsq << 6) | sq
-                scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 500
-                count += 1
-
-        # Queen captures
-        queens = get_pieces(board, B_QUEEN)
-        while queens:
-            sq, queens = pop_lsb(queens)
-            targets = queen_attacks_sq(sq, occ) & opp_occ
-            while targets:
-                tsq, targets = pop_lsb(targets)
-                victim = piece_on(board, tsq)
-                pseudo[count] = (tsq << 6) | sq
-                scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 900
-                count += 1
-
-        # King captures
-        ksq = lsb(get_pieces(board, B_KING))
-        if ksq < 64:
-            targets = king_attacks_sq(ksq) & opp_occ
-            while targets:
-                tsq, targets = pop_lsb(targets)
-                victim = piece_on(board, tsq)
-                pseudo[count] = (tsq << 6) | ksq
-                scores[count] = (_PIECE_VALUES[victim] if victim != -1 else 0) - 20000
-                count += 1
-
-    # --- Legality filter ---
-    king_piece = W_KING if side == 0 else B_KING
-    legal       = np.zeros(64, dtype=np.int32)
-    legal_scores = np.zeros(64, dtype=np.int32)
-    legal_count = 0
-    for i in range(count):
-        mv = pseudo[i]
-        nb = copy_board(board)
-        make_move(nb, mv)
-        ksq = lsb(get_pieces(nb, king_piece))
-        if ksq < 64 and not is_square_attacked(nb, ksq, 1 - side):
-            legal[legal_count]        = mv
-            legal_scores[legal_count] = scores[i]
-            legal_count += 1
-
-    # --- Sort by MVV-LVA score descending (insertion sort — fast for small N) ---
-    for i in range(1, legal_count):
-        key_mv  = legal[i]
-        key_sc  = legal_scores[i]
-        j = i - 1
-        while j >= 0 and legal_scores[j] < key_sc:
-            legal[j + 1]        = legal[j]
-            legal_scores[j + 1] = legal_scores[j]
-            j -= 1
-        legal[j + 1]        = key_mv
-        legal_scores[j + 1] = key_sc
-
-    return legal[:legal_count]
-
-
-# =============================================================================
-# QUIESCENCE SEARCH
-# =============================================================================
-# *** NEW FUNCTION ***
-#
-# Called at depth == 0 instead of evaluate() directly.
-# Keeps searching captures until the position is "quiet" (no captures left),
-# then evaluates. This eliminates the horizon effect where the bot plays a
-# move that looks good but hangs a piece on the very next move.
-#
-# How it fits into the search tree:
-#
-#   negamax (depth 5)
-#     └─ negamax (depth 4)
-#          └─ ... 
-#               └─ negamax (depth 0)  ← previously called evaluate() here
-#                    └─ quiescence()  ← NOW called here instead
-#                         ├─ stand-pat: is the static eval already good enough?
-#                         ├─ try capture 1 → quiescence()
-#                         ├─ try capture 2 → quiescence()
-#                         └─ ... until no captures left → evaluate()
-# =============================================================================
-
-@njit(cache=True)
-def quiescence(board, alpha, beta):
-    """
-    Quiescence search — resolves all captures before evaluating.
-
-    stand_pat:  The static evaluation of the current position.
-                If it's already >= beta we can prune immediately
-                (the opponent wouldn't have allowed us to reach here).
-                If it's > alpha it raises our lower bound.
-
-    Then we try every legal capture. If any capture improves alpha
-    further we recurse. Once no captures remain (or all are pruned)
-    we return alpha — a stable, horizon-free score.
-    """
-    stand_pat = evaluate(board)
-
-    # Beta cutoff — position is already too good for opponent to allow
-    if stand_pat >= beta:
-        return beta
-
-    # Raise alpha floor with the static eval
-    if stand_pat > alpha:
-        alpha = stand_pat
-
-    captures = generate_capture_moves(board)
-
-    for i in range(len(captures)):
-        move = captures[i]
-        nb   = copy_board(board)
-        make_move(nb, move)
-        score = -quiescence(nb, -beta, -alpha)
-
-        if score >= beta:
-            return beta          # Beta cutoff
-        if score > alpha:
-            alpha = score        # Improved lower bound
-
-    return alpha
-
-
 # =============================================================================
 # ZOBRIST HASHING
 # =============================================================================
 np.random.seed(42)
 ZOBRIST_PIECES = np.random.randint(0, 2**63, size=(12, 64), dtype=np.int64).view(np.uint64)
 ZOBRIST_SIDE   = np.random.randint(0, 2**63, dtype=np.int64).view(np.uint64)[()]
-# 16 possible castling states (4-bit mask)
-ZOBRIST_CASTLE = np.random.randint(0, 2**63, size=16, dtype=np.int64).view(np.uint64)
-# 65 possible EP squares (0-63, plus 64 for "none")
-ZOBRIST_EP     = np.random.randint(0, 2**63, size=65, dtype=np.int64).view(np.uint64)
 
 @njit(cache=True)
 def compute_hash(board):
     h = uint64(0)
-
-    # 1. Fast Bitboard Iteration (Skips empty squares entirely)
-    for p in range(12):
-        bb = board[p]
-        while bb:
-            sq, bb = pop_lsb(bb)
+    for sq in range(64):
+        p = piece_on(board, sq)
+        if p != -1:
             h ^= ZOBRIST_PIECES[p, sq]
-            
-    # 2. Side to move
     if get_side(board) == 1:
         h ^= ZOBRIST_SIDE
-        
-    # 3. Castling Rights (0-15)
-    h ^= ZOBRIST_CASTLE[get_castling(board)]
-    
-    # 4. En Passant Square (0-64)
-    h ^= ZOBRIST_EP[get_ep_square(board)]
-    
     return h
 
 # =============================================================================
@@ -738,13 +424,13 @@ def create_tt():
         value_type=types.UniTuple(types.int32, 4),
     )
 
-# Instantiate the global table
-GLOBAL_TT = create_tt()
-
-def clear_tt():
-    """Wipes the TT to free memory between games."""
-    global GLOBAL_TT
-    GLOBAL_TT = create_tt()
+# ---------------------------------------------------------------------------
+# THE FIX: create_tt() is called INSIDE get_best_move() every time, so the
+# TT is always fresh and never carries stale/corrupted data between games.
+# A module-level TT was the root cause: after the first game the table was
+# full of entries from a completely different position tree, causing the
+# engine to return garbage moves (or no move at all) and crash.
+# ---------------------------------------------------------------------------
 
 @njit(cache=True)
 def tt_store(tt, h, depth, score, flag, best_move):
@@ -757,11 +443,11 @@ def tt_probe(tt, h, depth, alpha, beta):
     stored_depth, stored_score, stored_flag, stored_move = tt[h]
     if stored_depth < depth:
         return False, int32(0), int32(stored_move)
-    if stored_flag == 1:
+    if stored_flag == 1:                          # EXACT
         return True, int32(stored_score), int32(stored_move)
-    elif stored_flag == 2 and stored_score >= beta:
+    elif stored_flag == 2 and stored_score >= beta:   # LOWER
         return True, int32(stored_score), int32(stored_move)
-    elif stored_flag == 3 and stored_score <= alpha:
+    elif stored_flag == 3 and stored_score <= alpha:  # UPPER
         return True, int32(stored_score), int32(stored_move)
     return False, int32(0), int32(stored_move)
 
@@ -770,103 +456,32 @@ def tt_probe(tt, h, depth, alpha, beta):
 # =============================================================================
 
 @njit(cache=True)
-def count_hash_in_history(h, hist, hist_len):
-    """Count occurrences of uint64 hash h in hist[0:hist_len]."""
-    count = int32(0)
-    for i in range(hist_len):
-        if hist[i] == h:
-            count += int32(1)
-    return count
-
-@njit(cache=True)
-def sort_moves(board, moves, tt_move):
-    """Scores and sorts moves in-place: TT move > Queen Promos > MVV-LVA Captures > Quiets."""
-    scores = np.zeros(len(moves), dtype=np.int32)
-    
-    for i in range(len(moves)):
-        mv = moves[i]
-        
-        # 1. Highest Priority: Transposition Table Move
-        if mv == tt_move:
-            scores[i] = 9000000
-            continue
-        
-        # 2. Second Priority: Queen Promotions (W_QUEEN = 4, B_QUEEN = 10)
-        promo = (mv >> 12) & 15
-        if promo == 4 or promo == 10:
-            scores[i] = 8000000
-            continue
-            
-        # 3. Third Priority: Captures ordered by MVV-LVA
-        to_sq = (mv >> 6) & 63
-        from_sq = mv & 63
-        victim = piece_on(board, to_sq)
-        
-        if victim != -1:
-            attacker = piece_on(board, from_sq)
-            scores[i] = 1000000 + _PIECE_VALUES[victim] * 10 - _PIECE_VALUES[attacker]
-        else:
-            scores[i] = 0
-
-    # Insertion sort (descending)
-    for i in range(1, len(moves)):
-        key_mv = moves[i]
-        key_sc = scores[i]
-        j = i - 1
-        while j >= 0 and scores[j] < key_sc:
-            moves[j + 1] = moves[j]
-            scores[j + 1] = scores[j]
-            j -= 1
-        moves[j + 1] = key_mv
-        scores[j + 1] = key_sc
-
-@njit(cache=True)
-def negamax(board, depth, alpha, beta, color, tt, allow_null, ply, hist, hist_len):
+def negamax(board, depth, alpha, beta, color, tt, allow_null):
     h = compute_hash(board)
-
-    # Hard cap the index to prevent out-of-bounds crashes
-    limit = hist_len + ply
-    if limit > 1023:
-        limit = int32(1023)
-
-    # Repetition check (punish draws when winning)
-    if ply > 0:
-        if count_hash_in_history(h, hist, hist_len + ply) >= 1:
-            return int32(-10)
-    
     hit, tt_score, tt_move = tt_probe(tt, h, depth, alpha, beta)
     if hit:
         return tt_score
 
     if depth <= 0:
-        # *** CHANGED: call quiescence() instead of evaluate() directly ***
-        # This is the single line change in negamax — everything else is new
-        # functions added above. quiescence() will keep searching captures
-        # until the position is stable, then call evaluate().
-        return quiescence(board, alpha, beta)
-
-    # Safely write the current hash to the history scratchpad
-    if hist_len + ply < 1024:
-        hist[hist_len + ply] = h
+        # evaluate() returns score from side-to-move perspective
+        return evaluate(board)
 
     # Null-move pruning
     if allow_null and depth >= 3:
         null_board = copy_board(board)
         make_null_move(null_board)
-        null_score = -negamax(null_board, depth - 3, -beta, -beta + 1, -color, tt, False, ply + 1, hist, hist_len)
+        null_score = -negamax(null_board, depth - 3, -beta, -beta + 1, -color, tt, False)
         if null_score >= beta:
             return beta
 
     moves = generate_legal_moves(board)
     if len(moves) == 0:
+        # No legal moves: checkmate or stalemate
         king_piece = 5 if get_side(board) == 0 else 11
         ksq = lsb(get_pieces(board, king_piece))
         if ksq < 64 and is_square_attacked(board, ksq, 1 - get_side(board)):
-            return -INFINITY + depth
-        return 0
-
-    # --- NEW: Sort moves to maximize Alpha-Beta pruning ---
-    sort_moves(board, moves, tt_move)
+            return -INFINITY + depth   # Checkmate (prefer faster mates)
+        return 0                       # Stalemate
 
     best_score  = -INFINITY
     best_move   = int32(0)
@@ -878,11 +493,11 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null, ply, hist, hist_le
         make_move(nb, move)
 
         if i == 0:
-            score = -negamax(nb, depth - 1, -beta, -alpha, -color, tt, True, ply + 1, hist, hist_len)
+            score = -negamax(nb, depth - 1, -beta, -alpha, -color, tt, True)
         else:
-            score = -negamax(nb, depth - 1, -alpha - 1, -alpha, -color, tt, True, ply + 1, hist, hist_len)
+            score = -negamax(nb, depth - 1, -alpha - 1, -alpha, -color, tt, True)
             if alpha < score < beta:
-                score = -negamax(nb, depth - 1, -beta, -alpha, -color, tt, True, ply + 1, hist, hist_len)
+                score = -negamax(nb, depth - 1, -beta, -alpha, -color, tt, True)
 
         if score > best_score:
             best_score = score
@@ -901,32 +516,20 @@ def negamax(board, depth, alpha, beta, color, tt, allow_null, ply, hist, hist_le
 # ITERATIVE DEEPENING + TIME MANAGEMENT
 # =============================================================================
 
-@njit(cache=True)
-def extract_tt_move(tt, h):
-    """Safely extracts the best move from the TT inside JIT memory."""
-    if uint64(h) in tt:
-        # tt[h] is (depth, score, flag, move)
-        return tt[h][3]
-    return int32(0)
-
-def get_best_move(board_array, time_left_ms, game_hist):
+def get_best_move(board_array, time_left_ms):
     """
     Iterative-deepening search with per-move time budget.
 
     A brand-new TT is created for every call so stale entries from
     previous games can never corrupt the search.
     """
-    tt = GLOBAL_TT
+    # Fresh TT every game — this is the key fix for the cross-game crash
+    tt = create_tt()
 
     start   = time.time()
+    # Allocate ~1/40th of remaining time, clamped to [0.5s, 8s]
     budget  = max(0.5, min(8.0, (time_left_ms / 1000.0) / 40.0))
 
-    # FIX 1: Double the array size to 1024 to prevent IndexError
-    hist = np.zeros(1024, dtype=np.uint64)
-    hist_len = np.int32(min(len(game_hist), 512))
-    for i in range(hist_len):
-        hist[i] = np.uint64(game_hist[i])
-    
     def elapsed():
         return time.time() - start
 
@@ -938,24 +541,25 @@ def get_best_move(board_array, time_left_ms, game_hist):
 
     for depth in range(1, 20):
         if not time_ok(0.5) and depth > 1:
-            break
+            break  # Don't start a depth we can't finish
 
-        score = negamax(board_array, depth, -INFINITY, INFINITY, 1, tt, True, np.int32(0), hist, hist_len)
+        score = negamax(board_array, depth, -INFINITY, INFINITY, 1, tt, True)
 
+        # Read best move from TT root entry
         h = compute_hash(board_array)
-        
-        # FIX 2: Safely extract the TT move using JIT instead of pure python
-        current_best = extract_tt_move(tt, h)
+        current_best = 0
+        if h in tt:
+            _, _, _, current_best = tt[h]
 
         last_best  = current_best if current_best != 0 else last_best
         last_score = score
 
-        print(f"  depth {depth:2d} | score {score:+6d} | "
-              f"move {current_best} | t={elapsed():.2f}s")
+        #print(f"  depth {depth:2d} | score {score:+6d} | "f"move {current_best} | t={elapsed():.2f}s")
 
         if not time_ok():
             break
 
+        # Stop early on forced mate
         if abs(score) > INFINITY - 100:
             break
 
